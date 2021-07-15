@@ -136,6 +136,7 @@ class oneflow_input(object):
         self.input_keys = []
         self.input_dict = {}
 
+
     def __getitem__(self, item):
         if isinstance(item, int):
             if item > (len(self.input_keys) - 1):
@@ -151,6 +152,7 @@ class oneflow_input(object):
 
         raise ValueError("Only integer, string, and slice accesses allowed.")
 
+
     def __setitem__(self, item, value):
         if isinstance(item, int):
             self.input_dict[self.input_keys[item]] = value
@@ -160,15 +162,19 @@ class oneflow_input(object):
         else:
             raise ValueError("Only integer and string indexed writes allowed.")
 
+
     def keys(self):
         return self.input_keys
+
 
     def __len__(self):
         return len(self.input_keys)
 
+
     def __iter__(self):
         self.n = 0
         return self
+
 
     def __next__(self):
         if self.n < len(self.input_keys):
