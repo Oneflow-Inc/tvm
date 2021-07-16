@@ -228,7 +228,7 @@ class OneflowGraph(object):
         return outputs
 
 
-    def from_onnx(self, job, model_dir_path):
+    def from_oneflow(self, job, model_dir_path):
         """
         Parameters
         ----------
@@ -440,7 +440,7 @@ class OneflowGraph(object):
         return sym
 
 
-def from_onnx(job, model_dir_path, shape=None, dtype="float32"):
+def from_oneflow(job, model_dir_path, shape=None, dtype="float32"):
     """
     Parameters
     ----------
@@ -477,5 +477,5 @@ def from_onnx(job, model_dir_path, shape=None, dtype="float32"):
     g = OneflowGraph(shape, dtype)
 
     # Use the graph proto as a scope so that ops can access other nodes if needed.
-    mod, params = g.from_onnx(job, model_dir_path)
+    mod, params = g.from_oneflow(job, model_dir_path)
     return mod, params
