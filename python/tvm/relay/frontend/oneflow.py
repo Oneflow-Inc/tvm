@@ -31,24 +31,14 @@ from .common import (
 
 __all__ = ["from_oneflow"]
 
-FLOW_2_STR_DTYPE = {
-    2: "float32",
-    3: "float64",
-    6: "int64",
-    5: "int32",
-    4: "int8",
-    7: "uint8",
-    9: "float16"
-}
-
-NUMPY_2_STR_DTYPE = {
-    "<class \'numpy.float32\'>": "float32",
-    "<class \'numpy.float64\'>": "float64",
-    "<class \'numpy.int64\'>": "int64",
-    "<class \'numpy.int32\'>": "int32",
-    "<class \'numpy.int8\'>": "int8",
-    "<class \'numpy.uint8\'>": "uint8",
-    "<class \'numpy.float16\'>": "float16"
+FLOW_2_NP_DTYPE = {
+    2: np.float32,
+    3: np.float64,
+    6: np.int64,
+    5: np.int32,
+    4: np.int8,
+    7: np.uint8,
+    9: np.float16
 }
 
 _identity_list = []
@@ -72,15 +62,15 @@ def is_output_op(node):
 def get_node_info(node):
     # 获取名字
     name = node.name
-    # 获取形状，转为list
+    # 获取形状，转为list->tuple
     shape = list(node.input_conf.blob_conf.shape.dim)
     # 获取数据类型
     dtype = node.input_conf.blob_conf.data_type
-    if dtype in list(FLOW_2_STR_DTYPE.keys()):
-        data_type = FLOW_2_STR_DTYPE[dtype]
+    if dtype in list(FLOW_2_NP_DTYPE.keys()):
+        data_type = FLOW_2_NP_DTYPE[dtype]
     else:
         raise IndexError('Please check the data type of your node: %s' % name)
-    return name, shape, data_type
+    return name, tuple(shape), data_type
 
 
 def parse_attr(attr):
@@ -122,8 +112,14 @@ def parse_attr(attr):
 
 
 def get_convert_map():
-    # 获取已实现的oneflow2relay op
-    return {}
+    # TODO: 已实现的oneflow2relay op
+    return {
+        # defs/math
+        # defs/activation
+        # defs/experimental
+        # defs/nn
+        # defs/tensor
+    }
 
 
 class oneflow_input(object):
@@ -208,24 +204,59 @@ class OneflowGraph(object):
         self._dtype = dtype
 
 
-    def _parse_input(self, node_input):
-        # TODO: 需要跟onnx.py结果作比较
+    def _parse_io(self, op_name, node, node_input, node_output, model_dir_path):
         inputs = oneflow_input()
-        for i in node_input:
-            if i != "":
-                inputs[i] = self._nodes[self._renames.get(i, i)]
+        node_name, node_shape, node_dtype = get_node_info(node)
+
+        for input_key in list(node_input.keys()):
+            input_name = str(node_name) + '-' + str(input_key)
+
+            if input_name != "":
+                # self._renames.get(i, i)可以获取需要改名字的层(暂时没有)
+                name = self._renames.get(input_name, input_name)
+
+                # 判断该节点是否是模型参数，在前面已经存入了模型参数
+                if input_name in self._params:
+                    # 若进入该分支，代表该节点为模型参数
+                    # 从params中剔除，加进nodes中
+                    self._params[input_name] = self._params.pop(input_name)
+                    self._nodes[input_name] = new_var(
+                        input_name,
+                        shape=node_shape,
+                        dtype=node_dtype
+                    )
+                    inputs[input_name] = self._nodes[name]
+                else:
+                    # TODO night: 通过层之间的.s进行沟通
+                    """
+                    举例：
+                    conv1-weight conv1-weight/out                可以直接导入
+                        该层已经在self._params存储，上方代码为重新导入
+                    conv1-in Input_0/out                         可以直接导入
+                    conv1-out conv1/out_0                        conv-op计算，临时文件夹存储
+
+                    conv1-bias_add-b conv1-bias/out              可以直接导入
+                    conv1-bias_add-a conv1/out_0                 conv1-out结果
+                    conv1-bias_add-out conv1-bias_add/out_0      add-op计算，临时文件夹存储
+
+                    conv1-activation-in conv1-bias_add/out_0     conv1-bias_add-out结果
+                    conv1-activation-out conv1-activation/out_0  activation-op计算，临时文件夹存储
+
+                    pool1-x conv1-activation/out_0               activation-op结果
+                    pool1-y pool1/y_0                            pool-op计算，临时文件夹存储
+                    ……………
+                    """
+                    inputs[input_name] = self._nodes[name]
             else:
-                inputs[i] = None
-        return inputs
+                inputs[input_name] = None
 
-
-    def _parse_output(self, op_name, node_output):
-        # TODO: 不是很理解这里在干什么，并且需要跟onnx.py结果作比较
+        outputs = node_output        
         if op_name.lower() == "dropout":
             if len(node_output) == 1:
-                return node_output
+                outputs = node_output
             outputs = node_output[:-1]
-        return outputs
+
+        return inputs, outputs
 
 
     def from_oneflow(self, job, model_dir_path):
@@ -259,15 +290,11 @@ class OneflowGraph(object):
         # 获取计算图参数的相关信息并存入类中
         for layer in model:
             # str(layer)是该层的名字，如：conv1-weight、dense2-bias
-            # 这一步用于排除训练完毕的标识
-            if str(layer) is 'System-Train-TrainStep-train_job':
-                break
-
             name = str(layer)                # 获取该层的名字，str
             array = model[layer].numpy()     # 获取该层参数，ndarray
             shape = model[layer].shape       # 获取该层参数的形状，tuple
-            dtype = NUMPY_2_STR_DTYPE[str(array.dtype)]
-            # 获取该层参数的数据类型，str，"int32"等
+            dtype = array.dtype
+            # 获取该层参数的数据类型，np.int32等
 
             # file_path = model[layer].file_path    # 模型参数所在的路径，str
 
@@ -289,7 +316,8 @@ class OneflowGraph(object):
                     # 开始转换input_node
                     if is_input_op(node):
                         # 判断该结点是不是input节点，是，则进入该if分支
-                        # TODO: node_dtype的数据类型是什么?
+                        # TODO: 这里可能不需要看参数在不在self_params里面
+                        # node_dtype的数据类型是np.dtype
                         node_name, node_shape, node_dtype = get_node_info(node)
                         # 判断该节点是否是模型参数，在上一段代码中已经存入了模型参数
                         if node_name in self._params:
@@ -312,7 +340,7 @@ class OneflowGraph(object):
                             if node_name in self._shape:
                                 # 若进入该分支，直接提取该节点之前存好的shape
                                 # 原因：shape由用户做过初始化
-                                name_shape = self._shape[node_name]
+                                node_shape = self._shape[node_name]
                             else:
                                 # 若进入该分支，则需要自己或许并存入shape
                                 warnings.warn('Input %s has unknown dimension shapes' % node_name)
@@ -358,11 +386,12 @@ class OneflowGraph(object):
                         op_name = node.user_conf.op_type_name
                         op_attr = parse_attr(node.user_conf.attr)
 
-                        # 构建该op的input
-                        node_inputs = self._parse_input(node.user_conf.input)
-
-                        # 构建该op的output
-                        node_outputs = self._parse_output(op_name, node.user_conf.output)
+                        # 构建该op的input, output
+                        node_inputs, node_outputs = self._parse_io(
+                            op_name, node, 
+                            node.user_conf.input, node.user_conf.output, 
+                            model_dir_path=model_dir_path
+                        )
 
                         op_attr["tvm_custom"] = {}
                         op_attr["tvm_custom"]["name"] = node.name
