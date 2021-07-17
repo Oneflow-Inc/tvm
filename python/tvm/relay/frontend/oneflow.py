@@ -1,7 +1,6 @@
 import os
 import copy
 import warnings
-from tempfile import TemporaryFile
 
 import numpy as np
 import tvm
@@ -70,14 +69,14 @@ def get_node_info(node):
     获取node基本信息: shape、data_type
     """
     # 获取形状，转为list->tuple
-    shape = list(node.input_conf.blob_conf.shape.dim)
+    shape = tuple(node.input_conf.blob_conf.shape.dim)
     # 获取数据类型
     dtype = node.input_conf.blob_conf.data_type
     if dtype in list(FLOW_2_NP_DTYPE.keys()):
         data_type = FLOW_2_NP_DTYPE[dtype]
     else:
         raise IndexError('Please check the data type of your node: %s' % node.name)
-    return tuple(shape), data_type
+    return shape, data_type
 
 
 def parse_attr(attr):
@@ -205,27 +204,71 @@ class OneflowGraph(object):
     ----------
     shape : dict of str to tuple, optional
         The input shape to the graph
-    dtype : str or dict of str to str
+    dtype : dict of str to str
         The input types to the graph
     """
-    def __init__(self, shape, dtype, model) -> None:
+    def __init__(self, shape, dtype, nodes, model_dir_path) -> None:
         self._nodes = {}
         self._params = {}
         self._inputs = {}
         self._num_input = 0
         self._num_param = 0
-        self._shape = shape.copy() if shape else {}
+        self._shape = {}
         self._input_names = []
-        self._dtype = dtype
+        self._dtype = {}
         self._model_array = {}
+
+        model = oneflow.checkpoint.get(model_dir_path)
         # model_array是以layer_name为key，以dict('path', 'params')为value的dict
         for layer in model:
             layer_p = {}
             layer_p['path'] = model[layer].file_path # 模型参数所在路径
             layer_p['params'] = model[layer].numpy() # 模型各层ndarray
             self._model_array[str(layer)] = layer_p
-        # TODO 7.17 night: 跑出来中间变量的shape、dtype，存入self._shape、self._dtype
 
+        for node_name in nodes:
+            node = nodes[node_name]
+            if is_user_op(node):
+                for input_name in node.user_conf.input:
+                    node_input_name = node.name + '-' + input_name
+
+                    node_input_path = getattr(node.user_conf.input[input_name], 's')
+                    if len(node_input_path) == 1:
+                        node_input_path = os.path.join(model_dir_path, node_input_path[0])
+                    else:
+                        pass
+
+                    if node_input_path in shape and node_input_name not in self._shape:
+                        self._shape[node_input_name] = shape[node_input_name]
+                    if node_input_path in dtype and node_input_name not in self._dtype:
+                        self._dtype[node_input_name] = dtype[node_input_name]
+
+                    self._nodes[node_input_name] = new_var(
+                        node_input_name, 
+                        shape=self._shape[node_input_name],
+                        dtype=self._dtype[node_input_name]
+                    )
+
+                for output_name in node.user_conf.output:
+                    node_output_name = node.name + '-' + output_name
+
+                    node_output_path = getattr(node.user_conf.output[output_name], 's')
+                    if len(node_output_path) == 1:
+                        node_output_path = os.path.join(model_dir_path, node_output_path[0])
+                    else:
+                        pass
+
+                    if node_output_path in shape and node_output_name not in self._shape:
+                        self._shape[node_output_name] = shape[node_output_name]
+                    if node_output_path in dtype and node_output_name not in self._dtype:
+                        self._dtype[node_output_name] = dtype[node_output_name]
+                    
+                    self._nodes[node_output_name] = new_var(
+                        node_output_name, 
+                        shape=self._shape[node_output_name],
+                        dtype=self._dtype[node_output_name]
+                    )
+        
 
     def _parse_input(self, node, node_input, model_dir_path):
         inputs = oneflow_input()
@@ -238,9 +281,10 @@ class OneflowGraph(object):
                 node_input_path = os.path.join(model_dir_path, node_input_path[0])
             else:
                 pass
-            
+
             node_input_shape = self._shape[node_input_name]
             node_input_dtype = self._dtype[node_input_name]
+
             if input_name != "":
                 if node_input_name not in self._nodes:
                     self._nodes[node_input_name] = new_var(
@@ -280,11 +324,11 @@ class OneflowGraph(object):
                 input_name node_input[input_key].s[0]:
 
                 conv1-weight conv1-weight/out                直接导入
-                conv1-in Input_0/out                         未知(应当是用户指定)
+                conv1-in Input_0/out                         可以从lbn处获得,已在__init__处理
                     得到conv1-out
                 
                 conv1-bias_add-b conv1-bias/out              直接导入
-                conv1-bias_add-a conv1/out_0                 conv1-out结果
+                conv1-bias_add-a conv1/out_0                 conv1-out结果,可以从lbn处获得
                     得到conv1-bias_add-out
                 
                 conv1-activation-in conv1-bias_add/out_0     conv1-bias_add-out结果
@@ -309,12 +353,13 @@ class OneflowGraph(object):
                         layer = self._model_array[name]
                         if str(node_init_path) == layer['path']:
                             node_init_array = layer['params']
-                            self._nodes[node_init_name] = new_var(
-                                node_init_name,
-                                shape=node_init_array.shape,
-                                dtype=node_init_array.dtype
-                            )
                             self._params[node_init_name] = node_init_array
+                            if node_init_name not in self._nodes:
+                                self._nodes[node_init_name] = new_var(
+                                    node_init_name,
+                                    shape=node_init_array.shape,
+                                    dtype=node_init_array.dtype
+                                )
 
         # 获取中间计算过程的oneflow2relay op，为后面转换中间计算过程的op做准备
         convert_map = get_convert_map()
@@ -336,15 +381,14 @@ class OneflowGraph(object):
                     self._input_names.append(node_name)
                     if node_name in self._shape:
                         # 若进入该分支，直接提取该节点之前存好的shape
-                        # 原因：shape由用户做过初始化
+                        # 原因：shape做过初始化
                         node_shape = self._shape[node_name]
                     else:
-                        # 若进入该分支，则需要自己或许并存入shape
                         warnings.warn('Input %s has unknown dimension shapes' % node_name)
                     
                     if isinstance(self._dtype, dict):
                         # 若进入该分支，直接提取该节点之前存好的dtype
-                        # 原因：dtype由用户做过初始化
+                        # 原因：dtype做过初始化
                         dtype = self._dtype[node_name] if node_name in self._dtype else node_dtype
                     else:
                         dtype = node_dtype
@@ -432,7 +476,7 @@ class OneflowGraph(object):
                 else:
                     op = _expr.TupleWrapper(fold_constant(op.astuple()), len(op))
 
-                # TODO: 针对多个输出，需要做相应处理
+                # TODO: 关于可选输出与输出的清洗，oneflow可能暂时不需要
                 if outputs_num > 1:
                     pass
 
@@ -488,17 +532,17 @@ class OneflowGraph(object):
         return sym
 
 
-def from_oneflow(job, model_dir_path, shape=None, dtype="float32"):
+def from_oneflow(eval_job, model_dir_path, shape=None, dtype=None):
     """
     Parameters
     ----------
-    job : job function
+    eval_job : job function, type='predict'
     model_dir_path: str
         The path of parameter
     shape : dict of str to tuple, optional
-        The input shape to the graph
+        The input shape to the graph, keys: node_param_path, values: shape
     dtype : str or dict of str to str
-        The input types to the graph
+        The input types to the graph, keys: node_param_path, values: dtype
 
     Returns
     -------
@@ -520,22 +564,29 @@ def from_oneflow(job, model_dir_path, shape=None, dtype="float32"):
             please determine whether the model has been trained")
 
     except ImportError:
-        pass
-
-    # 获取模型各层名字、大小、参数矩阵、路径、参数数据类型
-    model = oneflow.checkpoint.get(model_dir_path)
+        raise ImportError("please check that OneFlow is installed")
 
     # 获取job函数的所有可能信息，用于得到用户的job，导出计算图
     job_set = flow.get_job_set()
 
     # 创建一个以node.name为key，以node为value的字典，避免后续大量for循环查找浪费时间
     nodes = {}
+    shape = {}
+    dtype = {}
     for j in job_set.job:
-        if j.job_conf.job_name == job.__name__:
-            for node in job.net.op:
+        if j.job_conf.job_name == eval_job.__name__:
+            for node in eval_job.net.op:
                 nodes[node.name] = node
+            # 不需要跑出来中间变量，这里都存储好了
+            for lbn in eval_job.helper.lbn2logical_blob_desc:
+                lbd = eval_job.helper.lbn2logical_blob_desc[lbn]
+                node_path = os.path.join(model_dir_path, lbn)
+                node_shape = tuple(lbd.shape.dim)
+                node_dtype = lbd.data_type
+                shape[node_path] = node_shape
+                dtype[node_path] = FLOW_2_NP_DTYPE[node_dtype]
 
-    g = OneflowGraph(shape, dtype, model)
+    g = OneflowGraph(shape, dtype, nodes, model_dir_path)
 
     # Use the graph proto as a scope so that ops can access other nodes if needed.
     mod, params = g.from_oneflow(nodes=nodes, model_dir_path=model_dir_path)
