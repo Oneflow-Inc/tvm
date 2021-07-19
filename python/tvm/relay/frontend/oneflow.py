@@ -91,11 +91,11 @@ def parse_attr(attr):
             attr_str_ = attr_str.split(" ")[0]
 
             if attr_str_ == "at_list_float":
-                attrs[a] = np.array(list(attr[a].at_list_float.val)).astype(np.float32)
+                attrs[a] = tuple(attr[a].at_list_float.val)
             elif attr_str_ == "at_list_int32":
-                attrs[a] = np.array(list(attr[a].at_list_int32.val)).astype(np.int32)
+                attrs[a] = tuple(attr[a].at_list_int32.val)
             elif attr_str_ == "at_list_int64":
-                attrs[a] = np.array(list(attr[a].at_list_int64.val)).astype(np.int64)
+                attrs[a] = tuple(attr[a].at_list_int64.val)
 
         elif attr_str.split(":")[0] == "at_string":
             attrs[a] = attr[a].at_string
@@ -106,15 +106,15 @@ def parse_attr(attr):
         else:
             attr_str_ = attr_str.split(":")[0]
             if attr_str_ == "at_bool":
-                attrs[a] = np.array(attr[a].at_bool).astype(np.bool)
+                attrs[a] = attr[a].at_bool
             elif attr_str_ == "at_double":
-                attrs[a] = np.array(attr[a].at_double).astype(np.float64)
+                attrs[a] = attr[a].at_double
             elif attr_str_ == "at_float":
-                attrs[a] = np.array(attr[a].at_float).astype(np.float32)
+                attrs[a] = attr[a].at_float
             elif attr_str_ == "at_int32":
-                attrs[a] = np.array(attr[a].at_int32).astype(np.int32)
+                attrs[a] = attr[a].at_int32
             elif attr_str_ == "at_int64":
-                attrs[a] = np.array(attr[a].at_int64).astype(np.int64)
+                attrs[a] = attr[a].at_int64
     return attrs
 
 
@@ -211,25 +211,6 @@ def autopad(
     return _op.nn.pad(data, fold_constant(pad), pad_value, pad_type)
 
 
-# OneFlow的op_name自带了2d, 如: max_pool_2d
-# def dimension_picker(prefix, suffix=""):
-#     """Check that dimensions are supported.(pool)"""
-
-#     def _impl(attr):
-#         kernel = attr["pool_size"]
-#         if len(kernel) == 1:
-#             return prefix + "1d" + suffix
-#         if len(kernel) == 2:
-#             return prefix + "2d" + suffix
-#         if len(kernel) == 3:
-#             return prefix + "3d" + suffix
-#         msg = "Only 1D, 2D, and 3D kernels are supported for operator {}."
-#         op_name = prefix + "1d/2d/3d"
-#         raise tvm.error.OpAttributeInvalid(msg.format(op_name))
-
-#     return _impl
-
-
 def dimension_constraint():
     # TODO: 仅仅针对了pool
     def _dim_check(attrs):
@@ -287,7 +268,7 @@ class Pool(OneFlowOpConverter):
                         pad = get_pad_pair(axis_shape, kernel, stride, attr["padding"])
                         pad_tuple.append(pad)
                     pad_tuple = tuple([val for pair in zip(*pad_tuple) for val in pair])
-                    # TODO: oneflow的没有pads
+                    # TODO: oneflow的没有pads,应该是padding_before与padding_after组合
                     attr["pads"] = pad_tuple
                 else:
                     # Warning: Pool does not yet support dynamic shapes,
@@ -315,7 +296,7 @@ class Pool(OneFlowOpConverter):
                 raise tvm.error.OpAttributeInvalid(msg.format(attr["padding"], cls.name))
             attr.pop("padding")
 
-        # TODO: 找出oneflow中对应的attr
+        # TODO: 找出oneflow中对应的attr，没找到
         # if "storage_order" in attr:
         #     attr["layout"] = onnx_storage_order2layout(
         #         attr["storage_order"], dims=(len(input_shape) - 2), op_name=cls.name
@@ -340,7 +321,7 @@ class Conv(OneFlowOpConverter):
     """Operator converter for Conv."""
 
     @classmethod
-    def _impl_v1(cls, inputs, attr, params):
+    def _impl_v1(cls, inputs, attrs, params):
         # Use shape of input to determine convolution type.
         data = inputs[0]
         kernel = inputs[1]
@@ -350,44 +331,44 @@ class Conv(OneFlowOpConverter):
         kernel_type = infer_type(inputs[1])
         kernel_shapes = [get_const_tuple(kernel_type.checked_type.shape)]
 
-        if "kernel_size" not in attr:
-            attr["kernel_size"] = kernel_shapes[0][2:]
+        if "kernel_size" not in attrs:
+            attrs["kernel_size"] = kernel_shapes[0][2:]
 
         # TODO: 暂时没有在conv见到类似pool中的对应auto_pad的attr
-        if "padding" in attr:
-            attr["padding"] = attr["padding"].decode("utf-8")
-            if attr["padding"].lower() in ("same_upper", "same_lower"):
+        if "padding" in attrs:
+            attrs["padding"] = attrs["padding"].decode("utf-8")
+            if attrs["padding"].lower() in ("same_upper", "same_lower"):
                 # Warning: Convolution does not yet support dynamic shapes,
                 # one will need to run dynamic_to_static on this model after import
                 data = autopad(
                     data,
-                    attr.get("strides", [1] * (ndim - 2)),
-                    attr["kernel_shape"],
+                    attrs.get("strides", [1] * (ndim - 2)),
+                    attrs["kernel_size"],
                     # TODO: 不清楚是否对应
-                    attr.get("dilation_rate", [1] * (ndim - 2)),
+                    attrs.get("dilation_rate", [1] * (ndim - 2)),
                     ndim,
-                    mode=attr["padding"],
+                    mode=attrs["padding"],
                 )
-            # elif attr["auto_pad"].lower() == "vaild":
-            #     attr["pads"] = [0 for i in range(ndim - 2)]
-            # elif attr["auto_pad"].lower() == "notset":
+            # elif attrs["padding"].lower() == "vaild":
+            #     attrs["pads"] = [0 for i in range(ndim - 2)]
+            # elif attrs["padding"].lower() == "notset":
             #     pass
             else:
                 msg = 'Value {} in attribute "auto_pad" of operator Conv is invalid.'
-                raise tvm.error.OpAttributeInvalid(msg.format(attr["padding"]))
-            attr.pop("padding")
+                raise tvm.error.OpAttributeInvalid(msg.format(attrs["padding"]))
+            attrs.pop("padding")
 
         group_conv1d = False
-        if cls.name == "conv1d" and attr.get("groups") != 1:
+        if cls.name == "conv1d" and attrs.get("groups") != 1:
             group_conv1d = True
             # Expand input from NCW to NCHW
             data = _op.expand_dims(data, axis=2)
             # Expand kernel from OIW to OIHW
             kernel = _op.expand_dims(kernel, axis=2)
             # Add new value to kernel_shape, strices, dilation, pads, if needed
-            attr["kernel_size"] = [1] + list(attr["kernel_size"])
-            if "strides" in attr:
-                attr["strides"] = [1] + list(attr["strides"])
+            attrs["kernel_size"] = [1] + list(attrs["kernel_size"])
+            if "strides" in attrs:
+                attrs["strides"] = [1] + list(attrs["strides"])
             # TODO: 还没有找到对应的
             # if "dilations" in attr:
             #     attr["dilations"] = [1] + list(attr["dilations"])
@@ -403,15 +384,13 @@ class Conv(OneFlowOpConverter):
                 "group": ("groups", 1),
             },
             custom_check=dimension_constraint(),
-        )([data, kernel], attr, params)
+        )([data, kernel], attrs, params)
 
         # If this was a group_conv1d, squish output back to NCW.
         if group_conv1d:
             out = _op.squeeze(out, axis=[2])
 
-        use_bias = len(inputs) == 3
-        if use_bias:
-            out = _op.nn.bias_add(out, inputs[2])
+        # oneflow里面bias-add是一个专门的一个op, 用Add替换
         return out
 
 
@@ -435,11 +414,37 @@ class InstanceNorm(OneFlowOpConverter):
 
 
 class MatMul(OneFlowOpConverter):
-    # TODO
     """Operator converter for MatMul."""
+    # TODO: 这个应该对应的是onnx.py中的GEMM
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        assert len(inputs) == 3 or len(inputs) == 2, "Gemm op take 2 or 3 inputs, {} given".format(
+            len(inputs)
+        )
+        dtype = infer_type(inputs[0]).checked_type.dtype
+        # Y = alpha * A * B + beta * C
+        alpha = float(attrs.get("alpha", 1.0))
+        beta = float(attrs.get("beta", 1.0))
+        transA = bool(attrs.get("transpose_a", False))
+        transB = bool(attrs.get("transpose_b", False))
+        # get number of channels
+        channels = infer_channels(inputs[1], not transB)
+        if transA:
+            inputs[0] = _op.transpose(inputs[0], axes=(1, 0))
+        if not transB:
+            inputs[1] = _op.transpose(inputs[1], axes=(1, 0))
+        inputs[0] = _op.nn.batch_flatten(inputs[0])
+        if alpha != 1.0:
+            inputs[0] *= _expr.const(alpha, dtype=dtype)
+        out = _op.nn.dense(inputs[0], inputs[1], units=channels)
+        if len(inputs) == 3:
+            out = out + _expr.const(beta, dtype=dtype) * inputs[2]
+        return out
 
 
 class Add(OneFlowOpConverter):
+    # TODO: attrs 有axis选项，可能需要处理
     """Operator converter for Add."""
 
     @classmethod
@@ -468,12 +473,45 @@ class Reshape(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         return _op.reshape(inputs[0], attrs["shape"])
 
+    
+class Softmax(OneFlowOpConverter):
+    """Operator converter for Softmax."""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attr, params):
+        axis = attr.get("axis", 1)
+        ndim = len(infer_shape(inputs[0]))
+        if axis < 0:
+            axis += ndim
+        axes = list(range(axis, ndim))
+        x = inputs[0]
+        m = _op.max(x, axes, keepdims=True)
+        e = _op.exp(x - m)
+        return e / _op.sum(e, axes, keepdims=True)
+
+
+class LogSoftmax(OneFlowOpConverter):
+    """Operator converter for Softmax."""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attr, params):
+        axis = attr.get("axis", 1)
+        ndim = len(infer_shape(inputs[0]))
+        if axis < 0:
+            axis += ndim
+        axes = list(range(axis, ndim))
+        x = inputs[0]
+        m = _op.max(x, axes, keepdims=True)
+        e = _op.exp(x - m)
+        s = _op.sum(e, axes, keepdims=True)
+        return x - m - _op.log(s)
+
 
 def get_convert_map():
     # TODO: 记录实现的oneflow2relay op
     return {
         # defs/math
-        "bias_add": Add.get_converter(),
+        "bias_add": Add.get_converter(), # TODO: 这个oneflow多了一个axis，可能需要修改
         "log": Renamer("log"),
         "acos": Renamer("acos"),
         "acosh": Renamer("acosh"),
@@ -489,6 +527,9 @@ def get_convert_map():
         "tanh": Renamer("tanh"),
         "pow": Renamer("power"),
         "exp": Renamer("exp"),
+        "floor": Renamer("floor"),
+        "ceil": Renamer("ceil"),
+        "round": Renamer("round"),
         # defs/activation
         "sigmoid": Renamer("sigmoid"),
         "relu": Renamer("relu"),
@@ -497,12 +538,23 @@ def get_convert_map():
         "max_pool_2d": MaxPool.get_converter(),
         "dropout": AttrCvt("dropout", {"ratio": "rate"}, ignores=["is_test"]),
         # defs/tensor
-        "matmul": MatMul.get_converter(),
+        "matmul": MatMul.get_converter(), # TODO: 究竟是matmul还是gemm
         # defs/others
-        # TODO: softmax交叉熵
+        # TODO: softmax交叉熵，有softmax,去pytorch里面找找
         "sparse_softmax_cross_entropy": None,
-        "reshape": Reshape.get_converter(),
+        "reshape": Reshape.get_converter(), # onnx.py中这个跟resize还不太一样
     }
+
+
+class Softplus(OneFlowOpConverter):
+    """Operator converter for Softplus."""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attr, params):
+        data = inputs[0]
+        data_dtype = infer_type(data).checked_type.dtype
+        data = _op.exp(data) + _expr.const(1, dtype=data_dtype)
+        return _op.log(data)
 
 
 class oneflow_input(object):
