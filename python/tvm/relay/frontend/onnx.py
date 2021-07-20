@@ -3640,6 +3640,11 @@ class GraphProto:
                     dtype = d_type
                 self._nodes[i_name] = new_var(i_name, shape=i_shape, dtype=dtype)
             self._inputs[i_name] = self._nodes[i_name]
+
+        print("inputs: ------------------------")
+        print(self._inputs)
+        print()
+
         # Only check user inputs in the outer-most graph scope.
         if self._old_manager is None:
             assert all(
@@ -3731,6 +3736,11 @@ class GraphProto:
         # now return the outputs
         outputs = [self._nodes[self._parse_value_proto(i)] for i in graph.output]
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
+
+        print("outputs: -----------------------")
+        print(outputs)
+        print()
+
         # If requested, directly return the converted expressions.
         if get_output_expr:
             return outputs

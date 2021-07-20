@@ -299,6 +299,7 @@ class Pool(OneFlowOpConverter):
                         pad_value=pad_val,
                         mode=attrs["padding"].upper(),
                     )
+            
             elif attrs["padding"].lower() == "valid":
                 attrs["pads"] = tuple([0 for _ in range(ndim - 2)])
             elif attrs["padding"].lower() == "same":
@@ -309,27 +310,35 @@ class Pool(OneFlowOpConverter):
                 msg = 'Value {} in attribute "padding" of operator {} is invalid.'
                 raise tvm.error.OpAttributeInvalid(msg.format(attrs["padding"], cls.name))
             attrs.pop("padding")
-        
-        print(attrs)
 
-        # TODO: NO max_pool?: tvm.error.OpNotImplemented: Unable to map op_name max_pool to relay
-        return AttrCvt(
+        if "padding_before" not in attrs:
+            attrs["padding_before"] = [0, 0]
+        if "padding_after" not in attrs:
+            attrs["padding_after"] = [0, 0]
+            attrs["pads"] = [attrs["padding_after"][0], attrs["padding_before"][0],
+                             attrs["padding_after"][1], attrs["padding_before"][1]]
+        attrs.pop("padding_before")
+        attrs.pop("padding_after")
+
+        out = AttrCvt(
             op_name=cls.name,
             transforms={
                 "kernel_shape": "pool_size",
                 "pads": ("padding", 0),
                 "dilations": ("dilation", 1),
             },
-            ignores=["storage_order"],
+            # TODO: NCHW与其他数据之间的转换
+            ignores=["storage_order", "data_format"],
             # TODO: ??? transforms doesn't work ???
             # custom_check=dimension_constraint(),
         )([data], attrs, params)
 
+        return out
+
 
 class Conv(OneFlowOpConverter):
-    # TODO: only conv2d
     """Operator converter for Conv."""
-    name = "conv2d"
+    name = ""
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
@@ -386,11 +395,15 @@ class Conv(OneFlowOpConverter):
                 attrs["dilations"] = [1] + list(attrs["dilation_rate"])
                 attrs.pop("dilation_rate")
 
-        if "padding_before" in attrs:
-            attrs["pads"] = [0, attrs["padding_before"][0], 0, attrs["padding_before"][1]]
-            attrs.pop("padding_before")
+        if "padding_before" not in attrs:
+            attrs["padding_before"] = [0, 0]
+        if "padding_after" not in attrs:
+            attrs["padding_after"] = [0, 0]
+        attrs["pads"] = [attrs["padding_after"][0], attrs["padding_before"][0],
+                         attrs["padding_after"][1], attrs["padding_before"][1]]
+        attrs.pop("padding_before")
+        attrs.pop("padding_after")
 
-        print(attrs)
         out = AttrCvt(
             op_name=cls.name,
             transforms={
@@ -409,6 +422,11 @@ class Conv(OneFlowOpConverter):
 
         # oneflow里面bias-add是一个专门的一个op, 用Add替换
         return out
+
+
+class Conv2d(Conv):
+    """Operator converter for Conv2d."""
+    name = "conv2d"
 
 
 class BatchNorm(OneFlowOpConverter):
@@ -457,6 +475,7 @@ class MatMul(OneFlowOpConverter):
         out = _op.nn.dense(inputs[0], inputs[1], units=channels)
         if len(inputs) == 3:
             out = out + _expr.const(beta, dtype=dtype) * inputs[2]
+
         return out
 
 
@@ -467,14 +486,15 @@ class Add(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "op {} take 2 inputs, {} given".format(cls.name, len(inputs))
-        
+        out = get_relay_op("add")(*inputs)
+
         return get_relay_op("add")(*inputs)
 
 
 class MaxPool(Pool):
     """Operator converter for MaxPool"""
 
-    name = "max_pool"
+    name = "max_pool2d"
 
 
 class AveragePool(Pool):
@@ -488,7 +508,9 @@ class Reshape(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        return _op.reshape(inputs[0], attrs["shape"])
+        out = _op.reshape(inputs[0], attrs["shape"])
+
+        return out
 
     
 class Softmax(OneFlowOpConverter):
@@ -524,6 +546,15 @@ class LogSoftmax(OneFlowOpConverter):
         return x - m - _op.log(s)
 
 
+class Dropout(OneFlowOpConverter):
+
+    @classmethod
+    def _impl_v1(cls, inputs, attr, params):
+        out = AttrCvt("dropout", {"ratio": "rate"}, ignores=["is_test"])
+
+        return out
+
+
 def get_convert_map():
     # TODO: 记录实现的oneflow2relay op
     return {
@@ -551,9 +582,9 @@ def get_convert_map():
         "sigmoid": Renamer("sigmoid"),
         "relu": Renamer("relu"),
         # defs/nn
-        "conv2d": Conv.get_converter(),
+        "conv2d": Conv2d.get_converter(),
         "max_pool_2d": MaxPool.get_converter(),
-        "dropout": AttrCvt("dropout", {"ratio": "rate"}, ignores=["is_test"]),
+        "dropout": Dropout.get_converter(),
         # defs/tensor
         "matmul": MatMul.get_converter(), # TODO: 究竟是matmul还是gemm
         # defs/others
@@ -836,7 +867,6 @@ class OneflowGraph(object):
         for node_name in nodes:
             node = nodes[node_name]
             if is_output_op(node):
-
                 output_path = getattr(node.return_conf, "in")
                 self._output_path.append(os.path.join(model_dir_path, output_path))
 
@@ -862,8 +892,6 @@ class OneflowGraph(object):
             
             # 开始转换
             if is_user_op(node):
-                print(node_name)
-
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
 
@@ -887,13 +915,16 @@ class OneflowGraph(object):
                     node_outputs.append(node_output_name)
 
                 node_outputs = fix_outputs(op_name, node_outputs)
+
                 op_attr["tvm_custom"] = {}
                 # TODO: onnx.py这里实际的name是空，没有看明白
+                # 可能是 common.py line 405: ignore 'tvm_custom' always
                 op_attr["tvm_custom"]["name"] = ''
                 op_attr["tvm_custom"]["num_outputs"] = len(node_outputs)
 
                 # 转换核心语句
                 op = self._convert_operator(op_name, node_inputs, op_attr)
+                print(op)
 
                 # 判断网络有多少个输出，并相应做出调整
                 if not isinstance(op, _expr.TupleWrapper):
@@ -921,29 +952,49 @@ class OneflowGraph(object):
                     for k, i in zip(list(node_outputs), range(len(node_outputs))):
                         self._nodes[k] = op[i]
 
+        # for n in self._nodes:
+        #     print(self._nodes[n])
+        #     print()
+
         outputs = []
-        for input_name in node.user_conf.input:
-            node_input_name = str(node_name) + '-' + str(input_name)
+        # TODO: 这里应该加上上面处理的所有op与free var
+        # TODO: add部分好像需要处理较大处理
+        for node_name in nodes:
+            node = nodes[node_name]
+            if is_user_op(node):
+                for input_name in node.user_conf.output:
+                    
+                    node_input_name = str(node_name) + '-' + str(input_name)
 
-            node_input_path = getattr(node.user_conf.output[input_name], 's')
-            if len(node_input_path) == 1:
-                node_input_path = os.path.join(model_dir_path, node_input_path[0])
-            else:
-                pass
+                    node_input_path = getattr(node.user_conf.output[input_name], 's')
+                    if len(node_input_path) == 1:
+                        node_input_path = os.path.join(model_dir_path, node_input_path[0])
+                    else:
+                        pass
 
-            if node_input_path in self._output_path:
-                outputs.append(node_input_name)
+                    if node_input_path in self._output_path:
+                        outputs.append(self._nodes[node_input_name])
+
+        print("inputs: ------------------------")
+        print(self._inputs)
+        print()
+
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
+        print("outputs: -----------------------")
+        print(outputs)
+        print()
 
         # 转换为relay IR
         free_vars = analysis.free_vars(outputs)
+
         nodes = {v: k for k, v in self._nodes.items()}
         free_vars = [nodes[var] for var in free_vars]
-        for i_name in self._params:
-            if i_name in free_vars and i_name not in self._inputs:
-                self._inputs[i_name] = self._nodes[i_name]
+
         # Create a function from our output expression and all input variables.
         func = _function.Function([v for _, v in self._inputs.items()], outputs)
+
+        print(func)
+
         return IRModule.from_expr(func), self._params
 
 
