@@ -32,4 +32,4 @@ from .darknet import from_darknet
 from .pytorch import from_pytorch
 from .caffe import from_caffe
 from .change_datatype import ChangeDatatype
-from .oneflow import from_onnx
+from .oneflow import from_oneflow

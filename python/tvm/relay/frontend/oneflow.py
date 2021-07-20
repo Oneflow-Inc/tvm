@@ -42,6 +42,16 @@ FLOW_2_NP_DTYPE = {
     9: np.float16
 }
 
+NP_2_TVM_DTYPE = {
+    np.float16: "float16",
+    np.float32: "float32",
+    np.float64: "float64",
+    np.int64: "int64",
+    np.int32: "int32",
+    np.int8: "int8",
+    np.uint8: "uint8",
+}
+
 _identity_list = []
 
 
@@ -212,9 +222,8 @@ def autopad(
 
 
 def dimension_constraint():
-    # TODO: 仅仅针对了pool
     def _dim_check(attrs):
-        if len(attrs["pool_size"]) in [1, 2, 3]:
+        if len(attrs["kernel_shape"]) in [1, 2, 3]:
             return True
         return False
 
@@ -250,26 +259,30 @@ class Pool(OneFlowOpConverter):
     name = ""
 
     @classmethod
-    def _impl_v1(cls, inputs, attr, params):
+    def _impl_v1(cls, inputs, attrs, params):
         data = inputs[0]
         input_shape = infer_shape(data)
         input_dtype = infer_type(data).checked_type.dtype
         ndim = len(input_shape)
-        if "padding" in attr:
-            attr["padding"] = attr["padding"].decode("utf-8")
-            if attr["padding"].lower() in ("same_upper", "same_lower"):
+
+        # TODO
+        if attrs["data_format"] == "channels_first":
+            attrs["data_format"] = "NCHW"
+        else:
+            attrs["data_format"] = "NHMC"
+
+        if "padding" in attrs:
+            if attrs["padding"].lower() in ("same_upper", "same_lower"):
                 if cls.name == "avg_pool":
                     pad_tuple = []
                     for axis in range(len(input_shape) - 2):
                         axis_shape = input_shape[2 + axis]
-                        stride = attr.get("strides", [1] * ndim)[axis]
-                        # TODO: oneflow里面没有kernel_shape, 应该是pool_size
-                        kernel = attr["pool_size"][axis]
-                        pad = get_pad_pair(axis_shape, kernel, stride, attr["padding"])
+                        stride = attrs.get("strides", [1] * ndim)[axis]
+                        kernel = attrs["pool_size"][axis]
+                        pad = get_pad_pair(axis_shape, kernel, stride, attrs["padding"])
                         pad_tuple.append(pad)
                     pad_tuple = tuple([val for pair in zip(*pad_tuple) for val in pair])
-                    # TODO: oneflow的没有pads,应该是padding_before与padding_after组合
-                    attr["pads"] = pad_tuple
+                    attrs["pads"] = pad_tuple
                 else:
                     # Warning: Pool does not yet support dynamic shapes,
                     # one will need to run dynamic_to_static on this model after import
@@ -279,31 +292,27 @@ class Pool(OneFlowOpConverter):
                         pad_val = np.finfo(np.dtype(input_dtype)).min
                     data = autopad(
                         data,
-                        attr.get("strides", [1] * (ndim - 2)),
-                        attr["pool_size"],
+                        attrs.get("strides", [1] * (ndim - 2)),
+                        attrs["pool_size"],
                         [1] * ndim,
                         ndim,
                         pad_value=pad_val,
-                        mode=attr["padding"].lower(),
+                        mode=attrs["padding"].upper(),
                     )
-            # TODO: 暂时没有遇到这俩个选项
-            # elif attr["padding"].lower() == "valid":
-            #     attr["pads"] = tuple([0 for i in range(ndim - 2)])
-            # elif attr["padding"].lower() == "notset":
-            #     pass
+            elif attrs["padding"].lower() == "valid":
+                attrs["pads"] = tuple([0 for _ in range(ndim - 2)])
+            elif attrs["padding"].lower() == "same":
+                # TODO
+                pass
+        
             else:
                 msg = 'Value {} in attribute "padding" of operator {} is invalid.'
-                raise tvm.error.OpAttributeInvalid(msg.format(attr["padding"], cls.name))
-            attr.pop("padding")
+                raise tvm.error.OpAttributeInvalid(msg.format(attrs["padding"], cls.name))
+            attrs.pop("padding")
+        
+        print(attrs)
 
-        # TODO: 找出oneflow中对应的attr，没找到
-        # if "storage_order" in attr:
-        #     attr["layout"] = onnx_storage_order2layout(
-        #         attr["storage_order"], dims=(len(input_shape) - 2), op_name=cls.name
-        #     )
-        # else:
-        #     attr["layout"] = onnx_default_layout(dims=(len(input_shape) - 2), op_name=cls.name)
-
+        # TODO: NO max_pool?: tvm.error.OpNotImplemented: Unable to map op_name max_pool to relay
         return AttrCvt(
             op_name=cls.name,
             transforms={
@@ -312,13 +321,15 @@ class Pool(OneFlowOpConverter):
                 "dilations": ("dilation", 1),
             },
             ignores=["storage_order"],
-            custom_check=dimension_constraint(),
-        )([data], attr, params)
+            # TODO: ??? transforms doesn't work ???
+            # custom_check=dimension_constraint(),
+        )([data], attrs, params)
 
 
 class Conv(OneFlowOpConverter):
-    # TODO: 关于2d的判断
+    # TODO: only conv2d
     """Operator converter for Conv."""
+    name = "conv2d"
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
@@ -334,9 +345,7 @@ class Conv(OneFlowOpConverter):
         if "kernel_size" not in attrs:
             attrs["kernel_size"] = kernel_shapes[0][2:]
 
-        # TODO: 暂时没有在conv见到类似pool中的对应auto_pad的attr
         if "padding" in attrs:
-            attrs["padding"] = attrs["padding"].decode("utf-8")
             if attrs["padding"].lower() in ("same_upper", "same_lower"):
                 # Warning: Convolution does not yet support dynamic shapes,
                 # one will need to run dynamic_to_static on this model after import
@@ -344,19 +353,23 @@ class Conv(OneFlowOpConverter):
                     data,
                     attrs.get("strides", [1] * (ndim - 2)),
                     attrs["kernel_size"],
-                    # TODO: 不清楚是否对应
                     attrs.get("dilation_rate", [1] * (ndim - 2)),
                     ndim,
-                    mode=attrs["padding"],
+                    mode=attrs["padding"].upper(),
                 )
-            # elif attrs["padding"].lower() == "vaild":
-            #     attrs["pads"] = [0 for i in range(ndim - 2)]
-            # elif attrs["padding"].lower() == "notset":
-            #     pass
+            elif attrs["padding"].lower() == "vaild":
+                attrs["pads"] = [0 for i in range(ndim - 2)]
+            elif attrs["padding"].lower() == "same":
+                pass
             else:
-                msg = 'Value {} in attribute "auto_pad" of operator Conv is invalid.'
+                msg = 'Value {} in attribute "padding" of operator Conv is invalid.'
                 raise tvm.error.OpAttributeInvalid(msg.format(attrs["padding"]))
             attrs.pop("padding")
+
+        if "dilation_rate" in attrs:
+            # TODO: transforms doesn't work
+            attrs["dilations"] = list(attrs["dilation_rate"])
+            attrs.pop("dilation_rate")
 
         group_conv1d = False
         if cls.name == "conv1d" and attrs.get("groups") != 1:
@@ -369,21 +382,25 @@ class Conv(OneFlowOpConverter):
             attrs["kernel_size"] = [1] + list(attrs["kernel_size"])
             if "strides" in attrs:
                 attrs["strides"] = [1] + list(attrs["strides"])
-            # TODO: 还没有找到对应的
-            # if "dilations" in attr:
-            #     attr["dilations"] = [1] + list(attr["dilations"])
-            # if "pads" in attr:
-            #     attr["pads"] = [0, attr["pads"][0], 0, attr["pads"][1]]
+            if "dilation_rate" in attrs:
+                attrs["dilations"] = [1] + list(attrs["dilation_rate"])
+                attrs.pop("dilation_rate")
 
+        if "padding_before" in attrs:
+            attrs["pads"] = [0, attrs["padding_before"][0], 0, attrs["padding_before"][1]]
+            attrs.pop("padding_before")
+
+        print(attrs)
         out = AttrCvt(
             op_name=cls.name,
             transforms={
                 "kernel_shape": "kernel_size",
-                "dilations": ("dilation", 1),
                 "pads": ("padding", 0),
                 "group": ("groups", 1),
             },
-            custom_check=dimension_constraint(),
+            # TODO: conv2d() got an unexpected keyword argument 'dilations' ???
+            ignores=["data_format", "filters", "dilations"],
+            # custom_check=dimension_constraint(),
         )([data, kernel], attrs, params)
 
         # If this was a group_conv1d, squish output back to NCW.
@@ -444,7 +461,7 @@ class MatMul(OneFlowOpConverter):
 
 
 class Add(OneFlowOpConverter):
-    # TODO: attrs 有axis选项，可能需要处理
+    # TODO: attrs 有axis选项，需要处理
     """Operator converter for Add."""
 
     @classmethod
@@ -540,8 +557,6 @@ def get_convert_map():
         # defs/tensor
         "matmul": MatMul.get_converter(), # TODO: 究竟是matmul还是gemm
         # defs/others
-        # TODO: softmax交叉熵，有softmax,去pytorch里面找找
-        "sparse_softmax_cross_entropy": None,
         "reshape": Reshape.get_converter(), # onnx.py中这个跟resize还不太一样
     }
 
@@ -631,6 +646,8 @@ class OneflowGraph(object):
         self._dtype = {}
         self._model_array = {}
 
+        import oneflow
+
         model = oneflow.checkpoint.get(model_dir_path)
         # model_array是以layer_name为key，以dict('path', 'params')为value的dict
         for layer in model:
@@ -644,6 +661,7 @@ class OneflowGraph(object):
             if is_user_op(node):
                 for input_name in node.user_conf.input:
                     node_input_name = node.name + '-' + input_name
+                    # print(node_input_name)
 
                     node_input_path = getattr(node.user_conf.input[input_name], 's')
                     if len(node_input_path) == 1:
@@ -652,9 +670,9 @@ class OneflowGraph(object):
                         pass
 
                     if node_input_path in shape and node_input_name not in self._shape:
-                        self._shape[node_input_name] = shape[node_input_name]
+                        self._shape[node_input_name] = shape[node_input_path]
                     if node_input_path in dtype and node_input_name not in self._dtype:
-                        self._dtype[node_input_name] = dtype[node_input_name]
+                        self._dtype[node_input_name] = dtype[node_input_path]
 
                     if node_input_name not in self._nodes:
                         self._nodes[node_input_name] = new_var(
@@ -665,6 +683,7 @@ class OneflowGraph(object):
 
                 for output_name in node.user_conf.output:
                     node_output_name = node.name + '-' + output_name
+                    # print(node_output_name)
 
                     node_output_path = getattr(node.user_conf.output[output_name], 's')
                     if len(node_output_path) == 1:
@@ -673,9 +692,9 @@ class OneflowGraph(object):
                         pass
 
                     if node_output_path in shape and node_output_name not in self._shape:
-                        self._shape[node_output_name] = shape[node_output_name]
+                        self._shape[node_output_name] = shape[node_output_path]
                     if node_output_path in dtype and node_output_name not in self._dtype:
-                        self._dtype[node_output_name] = dtype[node_output_name]
+                        self._dtype[node_output_name] = dtype[node_output_path]
                     
                     if node_output_name not in self._nodes:
                         self._nodes[node_output_name] = new_var(
@@ -683,7 +702,6 @@ class OneflowGraph(object):
                             shape=self._shape[node_output_name],
                             dtype=self._dtype[node_output_name]
                         )
-        
 
     def _parse_input(self, node, node_input, model_dir_path):
         inputs = oneflow_input()
@@ -787,6 +805,7 @@ class OneflowGraph(object):
             if is_input_op(node):
                 # 判断该结点是不是input节点，是，则进入该if分支
                 node_shape, node_dtype = get_node_info(node)
+                
                 if node_name in self._nodes:
                     # 若进入该分支，代表该节点已经被记录
                     continue
@@ -794,12 +813,6 @@ class OneflowGraph(object):
                     # 若进入该分支，代表该节点为input
                     self._num_input += 1
                     self._input_names.append(node_name)
-                    if node_name in self._shape:
-                        # 若进入该分支，直接提取该节点之前存好的shape
-                        # 原因：shape做过初始化
-                        node_shape = self._shape[node_name]
-                    else:
-                        warnings.warn('Input %s has unknown dimension shapes' % node_name)
                     
                     if isinstance(self._dtype, dict):
                         # 若进入该分支，直接提取该节点之前存好的dtype
@@ -807,6 +820,9 @@ class OneflowGraph(object):
                         dtype = self._dtype[node_name] if node_name in self._dtype else node_dtype
                     else:
                         dtype = node_dtype
+                    
+                    if dtype in NP_2_TVM_DTYPE:
+                        dtype = NP_2_TVM_DTYPE[dtype]
 
                     self._nodes[node_name] = new_var(
                         node_name,
@@ -820,6 +836,7 @@ class OneflowGraph(object):
         for node_name in nodes:
             node = nodes[node_name]
             if is_output_op(node):
+
                 output_path = getattr(node.return_conf, "in")
                 self._output_path.append(os.path.join(model_dir_path, output_path))
 
@@ -827,6 +844,7 @@ class OneflowGraph(object):
             node = nodes[node_name]
             # 开始转换中间计算过程的op(user_op)
             if is_user_op(node):
+
                 # 这里应该是op的type，而不是神经网络中用户指定的层的名字
                 op_name = node.user_conf.op_type_name
                 if(
@@ -844,6 +862,8 @@ class OneflowGraph(object):
             
             # 开始转换
             if is_user_op(node):
+                print(node_name)
+
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
 
@@ -979,7 +999,7 @@ def from_oneflow(eval_job, model_dir_path, shape=None, dtype=None):
         import oneflow
         import oneflow.experimental as flow
 
-        flow.enable_eager_execution()
+        # flow.enable_eager_execution()
         oneflow.config.enable_legacy_model_io(False)
 
         # 判断模型参数是否可以正常导入
@@ -997,18 +1017,18 @@ def from_oneflow(eval_job, model_dir_path, shape=None, dtype=None):
     nodes = {}
     shape = {}
     dtype = {}
-    for j in job_set.job:
-        if j.job_conf.job_name == eval_job.__name__:
-            for node in eval_job.net.op:
+    for job in job_set.job:
+        if job.job_conf.job_name == eval_job.__name__:
+            for node in job.net.op:
                 nodes[node.name] = node
             # 不需要跑出来中间变量，这里都存储好了
-            for lbn in eval_job.helper.lbn2logical_blob_desc:
-                lbd = eval_job.helper.lbn2logical_blob_desc[lbn]
+            for lbn in job.helper.lbn2logical_blob_desc:
+                lbd = job.helper.lbn2logical_blob_desc[lbn]
                 node_path = os.path.join(model_dir_path, lbn)
                 node_shape = tuple(lbd.shape.dim)
                 node_dtype = lbd.data_type
                 shape[node_path] = node_shape
-                dtype[node_path] = FLOW_2_NP_DTYPE[node_dtype]
+                dtype[node_path] = NP_2_TVM_DTYPE[FLOW_2_NP_DTYPE[node_dtype]]
 
     g = OneflowGraph(shape, dtype, nodes, model_dir_path)
 
