@@ -482,6 +482,7 @@ class MatMul(OneFlowOpConverter):
 class Add(OneFlowOpConverter):
     # TODO: attrs 有axis选项，需要处理
     """Operator converter for Add."""
+    name = "add"
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
@@ -676,6 +677,7 @@ class OneflowGraph(object):
         self._input_names = []
         self._dtype = {}
         self._model_array = {}
+        self._outputs = []
 
         import oneflow
 
@@ -734,33 +736,37 @@ class OneflowGraph(object):
                             dtype=self._dtype[node_output_name]
                         )
 
-    def _parse_input(self, node, node_input, model_dir_path):
-        inputs = oneflow_input()
+        self._output_path = []
+        for node_name in nodes:
+            node = nodes[node_name]
+            if is_output_op(node):
+                output_path = getattr(node.return_conf, "in")
+                self._output_path.append(os.path.join(model_dir_path, output_path))
 
-        for input_name in node_input:
-            node_input_name = node.name + '-' + input_name
+    def _parse_input(self, nodes, model_dir_path):
+        for node_name in nodes:
+            node = nodes[node_name]
+            
+            for input_name in node.user_conf.input:
+                node_input_name = node_name + '-' + input_name
+                # print(node_input_name)
 
-            node_input_path = getattr(node_input[input_name], 's')
-            if len(node_input_path) == 1:
-                node_input_path = os.path.join(model_dir_path, node_input_path[0])
-            else:
-                pass
+                node_input_path = getattr(node.user_conf.input[input_name], 's')
+                if len(node_input_path) == 1:
+                    node_input_path = os.path.join(model_dir_path, node_input_path[0])
+                else:
+                    pass
 
-            node_input_shape = self._shape[node_input_name]
-            node_input_dtype = self._dtype[node_input_name]
+                node_input_shape = self._shape[node_input_name]
+                node_input_dtype = self._dtype[node_input_name]
 
-            if node_input_name != "":
-                if node_input_name not in self._nodes:
-                    self._nodes[node_input_name] = new_var(
-                        node_input_name,
-                        shape=node_input_shape,
-                        dtype=node_input_dtype
-                    )
-                inputs[node_input_name] = self._nodes[node_input_name]
-            else:
-                inputs[node_input_name] = None
-
-        return inputs
+                if node_input_name != "":
+                    if node_input_name not in self._nodes:
+                        self._nodes[node_input_name] = new_var(
+                            node_input_name,
+                            shape=node_input_shape,
+                            dtype=node_input_dtype
+                        )
 
 
     def from_oneflow(self, nodes, model_dir_path):
@@ -829,46 +835,22 @@ class OneflowGraph(object):
         convert_map = get_convert_map()
         unsupported_ops = set()
 
-        # 获取计算图输入部分的节点,这一部分的是由用户指定
         for node_name in nodes:
             node = nodes[node_name]
-            # 开始转换input_node
-            if is_input_op(node):
-                # 判断该结点是不是input节点，是，则进入该if分支
-                node_shape, node_dtype = get_node_info(node)
-                
-                if node_name in self._nodes:
-                    # 若进入该分支，代表该节点已经被记录
-                    continue
-                else:
-                    # 若进入该分支，代表该节点为input
-                    self._num_input += 1
-                    self._input_names.append(node_name)
-                    
-                    if isinstance(self._dtype, dict):
-                        # 若进入该分支，直接提取该节点之前存好的dtype
-                        # 原因：dtype做过初始化
-                        dtype = self._dtype[node_name] if node_name in self._dtype else node_dtype
-                    else:
-                        dtype = node_dtype
-                    
-                    if dtype in NP_2_TVM_DTYPE:
-                        dtype = NP_2_TVM_DTYPE[dtype]
+            if is_user_op(node):
+                for input_name in node.user_conf.input:
+                    node_input_name = node.name + '-' + input_name
 
-                    self._nodes[node_name] = new_var(
-                        node_name,
-                        shape=node_shape,
-                        dtype=dtype
-                    )
-                
-                self._inputs[node_name] = self._nodes[node_name]
+                    node_input_shape = self._shape[node_input_name]
+                    node_input_dtype = self._dtype[node_input_name]
 
-        self._output_path = []
-        for node_name in nodes:
-            node = nodes[node_name]
-            if is_output_op(node):
-                output_path = getattr(node.return_conf, "in")
-                self._output_path.append(os.path.join(model_dir_path, output_path))
+                    if node_input_name != "":
+                        if node_input_name not in self._nodes:
+                            self._nodes[node_input_name] = new_var(
+                                node_input_name,
+                                shape=node_input_shape,
+                                dtype=node_input_dtype
+                            )
 
         for node_name in nodes:
             node = nodes[node_name]
@@ -889,19 +871,33 @@ class OneflowGraph(object):
                 msg = "The following operators are not supported for frontend OneFlow: "
                 msg += ", ".join(unsupported_ops)
                 raise tvm.error.OpNotImplemented(msg)
+
+            self._parse_input(
+                nodes,
+                model_dir_path=model_dir_path
+            )
             
             # 开始转换
             if is_user_op(node):
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
 
-                # 构建该op的input,中间变量也要包含进来
-                node_inputs = self._parse_input(
-                    node,
-                    node.user_conf.input,
-                    model_dir_path=model_dir_path
-                )
-                
+                node_inputs = oneflow_input()
+                # for node_name_ in nodes:
+                #     node_ = nodes[node_name_]
+                #     if is_user_op(node_):
+                for input_name_ in node.user_conf.input:
+                    node_input_name_ = node_name + '-' + input_name_
+                    if node_input_name_ in self._nodes:
+                        if node_input_name_ != "":
+                            node_inputs[node_input_name_] = self._nodes[node_input_name_]
+                        else:
+                            node_inputs[node_input_name_] = None
+
+                print("node_inputs: -------------")
+                for i in node_inputs:
+                    print(i)
+                print()
                 # node_outputs需要的都在_parse_input中被处理了
                 node_outputs = []
                 for output_name in node.user_conf.output:
@@ -924,7 +920,6 @@ class OneflowGraph(object):
 
                 # 转换核心语句
                 op = self._convert_operator(op_name, node_inputs, op_attr)
-                print(op)
 
                 # 判断网络有多少个输出，并相应做出调整
                 if not isinstance(op, _expr.TupleWrapper):
@@ -948,41 +943,34 @@ class OneflowGraph(object):
                 # 转换
                 if outputs_num == 1:
                     self._nodes[node_outputs[0]] = op
+                    self._outputs.append(node_outputs[0])
                 else:
                     for k, i in zip(list(node_outputs), range(len(node_outputs))):
+                        self._outputs.append(k)
                         self._nodes[k] = op[i]
-
-        # for n in self._nodes:
-        #     print(self._nodes[n])
-        #     print()
+        
+        print("outputs_name: ------------------")
+        for n in self._outputs:
+            print(n)
+            print()
 
         outputs = []
-        # TODO: 这里应该加上上面处理的所有op与free var
-        # TODO: add部分好像需要处理较大处理
         for node_name in nodes:
             node = nodes[node_name]
             if is_user_op(node):
-                for input_name in node.user_conf.output:
-                    
-                    node_input_name = str(node_name) + '-' + str(input_name)
+                for output_name in node.user_conf.output:
+                    node_output_name = str(node_name) + '-' + str(output_name)
 
-                    node_input_path = getattr(node.user_conf.output[input_name], 's')
-                    if len(node_input_path) == 1:
-                        node_input_path = os.path.join(model_dir_path, node_input_path[0])
+                    node_output_path = getattr(node.user_conf.output[output_name], 's')
+                    if len(node_output_path) == 1:
+                        node_output_path = os.path.join(model_dir_path, node_output_path[0])
                     else:
                         pass
 
-                    if node_input_path in self._output_path:
-                        outputs.append(self._nodes[node_input_name])
-
-        print("inputs: ------------------------")
-        print(self._inputs)
-        print()
+                    if node_output_name in self._outputs or node_output_path in self._output_path:
+                        outputs.append(self._nodes[node_output_name])
 
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
-        print("outputs: -----------------------")
-        print(outputs)
-        print()
 
         # 转换为relay IR
         free_vars = analysis.free_vars(outputs)
@@ -990,10 +978,26 @@ class OneflowGraph(object):
         nodes = {v: k for k, v in self._nodes.items()}
         free_vars = [nodes[var] for var in free_vars]
 
+        # free_vars都应该存储到self._inputs里头
+        for free_var in free_vars:
+            if free_var not in self._inputs:
+                self._inputs[free_var] = self._nodes[free_var]
+
+        print("inputs: ------------------------")
+        print(self._inputs)
+        print()
+
+        print("outputs: -----------------------")
+        for o in outputs:
+            print(o)
+            print()
+
         # Create a function from our output expression and all input variables.
         func = _function.Function([v for _, v in self._inputs.items()], outputs)
 
+        print("func: --------------------------")
         print(func)
+        print()
 
         return IRModule.from_expr(func), self._params
 
@@ -1024,6 +1028,10 @@ class OneflowGraph(object):
             sym = convert_map[op_name](node_inputs, op_attr, self._params)
         else:
             raise NotImplementedError("Operator {} not implemented.".format(op_name))
+
+        print("converting: -------------")
+        print(sym)
+        print()
         return sym
 
 

@@ -3641,8 +3641,9 @@ class GraphProto:
                 self._nodes[i_name] = new_var(i_name, shape=i_shape, dtype=dtype)
             self._inputs[i_name] = self._nodes[i_name]
 
-        print("inputs: ------------------------")
-        print(self._inputs)
+        print("nodes: --------------")
+        for n in self._nodes:
+            print(self._nodes[n])
         print()
 
         # Only check user inputs in the outer-most graph scope.
@@ -3678,6 +3679,11 @@ class GraphProto:
                     inputs[i] = self._nodes[self._renames.get(i, i)]
                 else:
                     inputs[i] = None
+
+            print("node_inputs: -------------")
+            for i in inputs:
+                print(i)
+            print()
             i_name = self._parse_value_proto(node)
             node_output = self._fix_outputs(op_name, node.output)
             attr["tvm_custom"] = {}
@@ -3685,6 +3691,7 @@ class GraphProto:
             attr["tvm_custom"]["num_outputs"] = len(node_output)
 
             op = self._convert_operator(op_name, inputs, attr, opset)
+
             if not isinstance(op, _expr.TupleWrapper):
                 outputs_num = 1
             else:
@@ -3735,11 +3742,8 @@ class GraphProto:
 
         # now return the outputs
         outputs = [self._nodes[self._parse_value_proto(i)] for i in graph.output]
-        outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
 
-        print("outputs: -----------------------")
-        print(outputs)
-        print()
+        outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
 
         # If requested, directly return the converted expressions.
         if get_output_expr:
@@ -3752,8 +3756,14 @@ class GraphProto:
         for i_name in self._params:
             if i_name in free_vars and i_name not in self._inputs:
                 self._inputs[i_name] = self._nodes[i_name]
+
         # Create a function from our output expression and all input variables.
         func = _function.Function([v for k, v in self._inputs.items()], outputs)
+
+        print("func: ---------------------------")
+        print(func)
+        print()
+
         return IRModule.from_expr(func), self._params
 
     def _parse_value_proto(self, value_proto):
@@ -3821,6 +3831,7 @@ class GraphProto:
             sym = convert_map[op_name](inputs, attrs, self._params)
         else:
             raise NotImplementedError("Operator {} not implemented.".format(op_name))
+
         return sym
 
     def _fix_outputs(self, op_name, outputs):
