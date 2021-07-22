@@ -460,10 +460,10 @@ class MatMul(OneFlowOpConverter):
         return out
 
 
-class Elemwise(OneFlowOpConverter):
+class Add(OneFlowOpConverter):
     """A helper class for elemwise op converters."""
 
-    name = ""
+    name = "add"
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
@@ -487,12 +487,6 @@ class Elemwise(OneFlowOpConverter):
                 axis = int(attrs.get("axis", 0))
                 inputs[i] = _op.expand_dims(inputs[i], axis=axis, num_newaxis=2)
         return get_relay_op(op_name)(*inputs)
-
-
-class Add(Elemwise):
-    """Operator converter for Add."""
-
-    name = "add"
 
 
 class MaxPool2d(Pool):
@@ -563,7 +557,7 @@ def get_convert_map():
     # TODO: 记录实现的oneflow2relay op
     return {
         # defs/math
-        "bias_add": Add.get_converter(), # TODO: 这个oneflow多了一个axis，可能需要修改
+        "bias_add": Add.get_converter(),
         "log": Renamer("log"),
         "acos": Renamer("acos"),
         "acosh": Renamer("acosh"),
@@ -590,9 +584,9 @@ def get_convert_map():
         "max_pool_2d": MaxPool2d.get_converter(),
         "dropout": Dropout.get_converter(),
         # defs/tensor
-        "matmul": MatMul.get_converter(), # TODO: 究竟是matmul还是gemm
+        "matmul": MatMul.get_converter(),
         # defs/others
-        "reshape": Reshape.get_converter(), # onnx.py中这个跟resize还不太一样
+        "reshape": Reshape.get_converter(),
     }
 
 
@@ -718,6 +712,7 @@ class OneflowGraph(object):
                                 shape=node_array.shape,
                                 dtype=str(node_array.dtype)
                             )
+
         """
         node_outputs的名字不会直接出现在node.user_conf.input里面
         所以在构建计算图的时候会导致层与层之间的联系被斩断
@@ -760,7 +755,7 @@ class OneflowGraph(object):
                     )
 
 
-    def from_oneflow(self, nodes, model_dir_path):
+    def from_oneflow(self, nodes, model_dir_path, freeze_params=True, user_input=None):
         """
         Parameters
         ----------
@@ -768,6 +763,22 @@ class OneflowGraph(object):
             contain the graph
         model_dir_path: str
             The path of parameter
+        freeze_params: bool
+            如果freeze_params为True，则计算图输入为网络第一层的输入，用户无法指定，如：
+            网络第一层输入为: %conv1-in: Tensor[(100, 1, 28, 28), float32]
+            用户指定输入为: %Input_0: Tensor[(1, 1, 28, 28), float32]
+            若freeze_params打开，则conv1-in为计算图输入，而非Input_0
+        user_input: dict
+            用户指定的计算图输入信息
+            {
+                node1_name: 
+                {
+                    'name': node1_name,    # str, like "conv1-in"
+                    'shape': node1_shape,  # tuple
+                    'dtype': node1_dtype   # str, like "float16"
+                }
+                ...
+            }
 
         Returns
         -------
@@ -777,16 +788,20 @@ class OneflowGraph(object):
             A dict of name: tvm.nd.array pairs, used as pretrained weights
         """
         # step 1: get the graph input
-        for node_name in nodes:
-            node = nodes[node_name]
-            if is_input_op(node):
-                if node_name not in self._nodes:
-                    self._nodes[node_name] = new_var(
-                        node_name, 
-                        shape=tuple(node.input_conf.blob_conf.shape.dim),
-                        dtype=FLOW_2_STR_DTYPE[node.input_conf.blob_conf.data_type]
+        if not freeze_params:
+            for node_init_name in user_input:
+                # 我们应该让用户定义如: conv1-in的输入，即第一层网络层的名字 + '-in'
+                if node_init_name not in self._nodes:
+                    raise KeyError("the key of user_input should be: \
+                        name of network layer 1(like \'conv1\') + \'-in\'")
+                else:
+                    self._nodes.pop[node_init_name]
+                    self._nodes[node_init_name] = new_var(
+                        node_init_name,
+                        shape=user_input[node_init_name]["shape"],
+                        dtype=user_input[node_init_name]["dtype"]
                     )
-                self._inputs[node_name] = self._nodes[node_name]
+                self._inputs[node_init_name] = self._nodes[node_init_name]
 
         # step 2: find out if unsupported ops are used
         # 获取中间计算过程的oneflow2relay op，为后面转换中间计算过程的op做准备
@@ -937,9 +952,6 @@ class OneflowGraph(object):
         if op_name in _identity_list:
             sym = get_relay_op(op_name)(*node_inputs, **op_attr)
         elif op_name in convert_map:
-            # conver_map[op_name]用来获取是哪一个op
-            # node_inputs: oneflow_input类
-            # op_attr
             sym = convert_map[op_name](node_inputs, op_attr, self._params)
         else:
             raise NotImplementedError("Operator {} not implemented.".format(op_name))
@@ -947,17 +959,29 @@ class OneflowGraph(object):
         return sym
 
 
-def from_oneflow(eval_job, model_dir_path, shapes=None, dtypes=None):
+def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
     """
     Parameters
     ----------
     eval_job : job function, type='predict'
     model_dir_path: str
         The path of parameter
-    shape : dict of str to tuple, optional
-        The input shape to the graph, keys: node_param_path, values: shape
-    dtype : str or dict of str to str
-        The input types to the graph, keys: node_param_path, values: dtype
+    freeze_params: bool
+        如果freeze_params为True，则计算图输入为网络第一层的输入，用户无法指定，如：
+        网络第一层输入为: %conv1-in: Tensor[(100, 1, 28, 28), float32]
+        用户指定输入为: %Input_0: Tensor[(1, 1, 28, 28), float32]
+        若freeze_params打开，则conv1-in为计算图输入，而非Input_0
+    user_input: dict
+        用户指定的计算图输入信息
+        {
+            node1_name: 
+            {
+                'name': node1_name,    # str, like "conv1-in"
+                'shape': node1_shape,  # tuple
+                'dtype': node1_dtype   # str, like "float16"
+            }
+            ...
+        }
 
     Returns
     -------
@@ -970,16 +994,19 @@ def from_oneflow(eval_job, model_dir_path, shapes=None, dtypes=None):
         import oneflow
         import oneflow.experimental as flow
 
-        # flow.enable_eager_execution()
         oneflow.config.enable_legacy_model_io(False)
 
-        # 判断模型参数是否可以正常导入
         if 'snapshot_done' not in os.listdir(model_dir_path):
             raise IndexError("\'snapshot_name\' is not in the model path, \
             please determine whether the model has been trained")
 
     except ImportError:
         raise ImportError("please check that OneFlow is installed")
+
+    if not freeze_params and user_input is None:
+        raise ValueError("if you want to specify graph input, please give the \'user_input\'")
+    if not freeze_params and user_input is not None:
+        warnings.warn("\'user_input\' will not work, please check the \'freeze_params\'")
 
     # 获取job函数的所有可能信息，用于得到用户的job，导出计算图
     job_set = flow.get_job_set()
@@ -989,13 +1016,7 @@ def from_oneflow(eval_job, model_dir_path, shapes=None, dtypes=None):
     shape = {}
     dtype = {}
 
-    if shapes is not None:
-        for key in shapes:
-            shape[key] = shapes[key]
-    if dtypes is not None:
-        for key in dtypes:
-            dtype[key] = dtypes[key]
-
+    # this will spend a long time
     for job in job_set.job:
         if job.job_conf.job_name == eval_job.__name__:
             for node in job.net.op:
@@ -1012,5 +1033,8 @@ def from_oneflow(eval_job, model_dir_path, shapes=None, dtypes=None):
     g = OneflowGraph(shape, dtype, nodes, model_dir_path)
 
     # Use the graph proto as a scope so that ops can access other nodes if needed.
-    mod, params = g.from_oneflow(nodes=nodes, model_dir_path=model_dir_path)
+    mod, params = g.from_oneflow(
+            nodes=nodes, model_dir_path=model_dir_path, 
+            freeze_params=freeze_params, 
+        )
     return mod, params
