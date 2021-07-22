@@ -3608,6 +3608,7 @@ class GraphProto:
                     shape=self._params[init_tensor.name].shape,
                     dtype=self._params[init_tensor.name].dtype,
                 )
+
         for i in graph.input:
             # from onnx v0.2, GraphProto.input has type ValueInfoProto,
             #  and the name is 'i.name'
@@ -3641,11 +3642,6 @@ class GraphProto:
                 self._nodes[i_name] = new_var(i_name, shape=i_shape, dtype=dtype)
             self._inputs[i_name] = self._nodes[i_name]
 
-        print("nodes: --------------")
-        for n in self._nodes:
-            print(self._nodes[n])
-        print()
-
         # Only check user inputs in the outer-most graph scope.
         if self._old_manager is None:
             assert all(
@@ -3669,21 +3665,19 @@ class GraphProto:
             msg += ", ".join(unsupported_ops)
             raise tvm.error.OpNotImplemented(msg)
         # construct nodes, nodes are stored as directed acyclic graph
+        print("converting: ------------------")
         for node in graph.node:
             op_name = node.op_type
             attr = self._parse_attr(node.attribute)
             # Create and populate onnx input object.
             inputs = onnx_input()
             for i in node.input:
-                if i != "":
-                    inputs[i] = self._nodes[self._renames.get(i, i)]
-                else:
-                    inputs[i] = None
+                if i in self._nodes:
+                    if i != "":
+                        inputs[i] = self._nodes[self._renames.get(i, i)]
+                    else:
+                        inputs[i] = None
 
-            print("node_inputs: -------------")
-            for i in inputs:
-                print(i)
-            print()
             i_name = self._parse_value_proto(node)
             node_output = self._fix_outputs(op_name, node.output)
             attr["tvm_custom"] = {}
@@ -3701,6 +3695,9 @@ class GraphProto:
                 op = fold_constant(op)
             else:
                 op = _expr.TupleWrapper(fold_constant(op.astuple()), len(op))
+
+            print("node output before num>1: -----")
+            print(node_output)
 
             if outputs_num > 1:
                 # ONNX supports optional outputs for some nodes.
@@ -3734,11 +3731,14 @@ class GraphProto:
                 len(node_output), outputs_num, op_name
             )
 
+            print("node output after num>1: -----")
+            print(node_output)
             if outputs_num == 1:
                 self._nodes[node_output[0]] = op
             else:
                 for k, i in zip(list(node_output), range(len(node_output))):
                     self._nodes[k] = op[i]
+            print()
 
         # now return the outputs
         outputs = [self._nodes[self._parse_value_proto(i)] for i in graph.output]
@@ -3759,10 +3759,6 @@ class GraphProto:
 
         # Create a function from our output expression and all input variables.
         func = _function.Function([v for k, v in self._inputs.items()], outputs)
-
-        print("func: ---------------------------")
-        print(func)
-        print()
 
         return IRModule.from_expr(func), self._params
 
