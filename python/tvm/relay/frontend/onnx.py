@@ -226,12 +226,10 @@ class OnnxOpConverter(object):
     @classmethod
     def get_converter(cls, opset):
         """Get converter matches given opset.
-
         Parameters
         ----------
         opset: int
             opset from model.
-
         Returns
         -------
         converter, which should be `_impl_vx`. Number x is the biggest
@@ -2081,7 +2079,6 @@ class LSTM(RNN):
         cls, X_steps, H_t, C_t, W, R, B, p_i, p_f, p_o, f_act, g_act, h_act, backwards=False
     ):
         """Create an unrolled lstm loop.
-
         See https://github.com/onnx/onnx/blob/master/docs/Operators.md for math.
         """
         h_list = []
@@ -2254,7 +2251,6 @@ class GRU(RNN):
         cls, X_steps, H_t, W, R, B, linear_before_reset, f_act, g_act, W_dtype, backwards=False
     ):
         """Create an unrolled gru loop.
-
         See https://github.com/onnx/onnx/blob/master/docs/Operators.md for math.
         """
         h_list = []
@@ -3513,22 +3509,18 @@ def _get_convert_map(opset):
 class GraphProto:
     """A helper class for handling Relay expression copying from pb2.GraphProto.
     Definition: https://github.com/onnx/onnx/blob/master/onnx/onnx.proto
-
         Parameters
     ----------
     shape : dict of str to tuple, optional
         The input shape to the graph
-
     dtype : str or dict of str to str
         The input types to the graph
-
     freeze_params: bool
         If this parameter is true, the importer will take any provided
         onnx input values (weights, shapes, etc) and embed them into the relay model
         as Constants instead of variables. This allows more aggressive optimizations
         at compile time and helps in making models static if certain inputs represent
         attributes relay would traditionally consider compile-time constants.
-
     """
 
     current = None
@@ -3565,31 +3557,25 @@ class GraphProto:
 
     def from_onnx(self, graph, opset, get_output_expr=False):
         """Construct Relay expression from ONNX graph.
-
         Onnx graph is a python protobuf object.
         The companion parameters will be handled automatically.
         However, the input names from onnx graph is vague, mixing inputs and
         network weights/bias such as "1", "2"...
         For convenience, we rename the `real` input names to "input_0",
         "input_1"... And renaming parameters to "param_0", "param_1"...
-
         Parameters
         ----------
         graph : onnx protobuf object
             The loaded onnx graph
-
         opset : opset version
-
         get_output_expr: bool
             If set to true, this conversion will return each output expression rather
             than a packaged module. This can be useful when converting subgraphs to
             relay.
-
         Returns
         -------
         mod : tvm.IRModule
             The returned relay module
-
         params : dict
             A dict of name: tvm.nd.array pairs, used as pretrained weights
         """
@@ -3608,7 +3594,6 @@ class GraphProto:
                     shape=self._params[init_tensor.name].shape,
                     dtype=self._params[init_tensor.name].dtype,
                 )
-
         for i in graph.input:
             # from onnx v0.2, GraphProto.input has type ValueInfoProto,
             #  and the name is 'i.name'
@@ -3641,7 +3626,6 @@ class GraphProto:
                     dtype = d_type
                 self._nodes[i_name] = new_var(i_name, shape=i_shape, dtype=dtype)
             self._inputs[i_name] = self._nodes[i_name]
-
         # Only check user inputs in the outer-most graph scope.
         if self._old_manager is None:
             assert all(
@@ -3665,19 +3649,16 @@ class GraphProto:
             msg += ", ".join(unsupported_ops)
             raise tvm.error.OpNotImplemented(msg)
         # construct nodes, nodes are stored as directed acyclic graph
-        print("converting: ------------------")
         for node in graph.node:
             op_name = node.op_type
             attr = self._parse_attr(node.attribute)
             # Create and populate onnx input object.
             inputs = onnx_input()
             for i in node.input:
-                if i in self._nodes:
-                    if i != "":
-                        inputs[i] = self._nodes[self._renames.get(i, i)]
-                    else:
-                        inputs[i] = None
-
+                if i != "":
+                    inputs[i] = self._nodes[self._renames.get(i, i)]
+                else:
+                    inputs[i] = None
             i_name = self._parse_value_proto(node)
             node_output = self._fix_outputs(op_name, node.output)
             attr["tvm_custom"] = {}
@@ -3685,7 +3666,6 @@ class GraphProto:
             attr["tvm_custom"]["num_outputs"] = len(node_output)
 
             op = self._convert_operator(op_name, inputs, attr, opset)
-
             if not isinstance(op, _expr.TupleWrapper):
                 outputs_num = 1
             else:
@@ -3695,9 +3675,6 @@ class GraphProto:
                 op = fold_constant(op)
             else:
                 op = _expr.TupleWrapper(fold_constant(op.astuple()), len(op))
-
-            print("node output before num>1: -----")
-            print(node_output)
 
             if outputs_num > 1:
                 # ONNX supports optional outputs for some nodes.
@@ -3731,20 +3708,15 @@ class GraphProto:
                 len(node_output), outputs_num, op_name
             )
 
-            print("node output after num>1: -----")
-            print(node_output)
             if outputs_num == 1:
                 self._nodes[node_output[0]] = op
             else:
                 for k, i in zip(list(node_output), range(len(node_output))):
                     self._nodes[k] = op[i]
-            print()
 
         # now return the outputs
         outputs = [self._nodes[self._parse_value_proto(i)] for i in graph.output]
-
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
-
         # If requested, directly return the converted expressions.
         if get_output_expr:
             return outputs
@@ -3756,10 +3728,8 @@ class GraphProto:
         for i_name in self._params:
             if i_name in free_vars and i_name not in self._inputs:
                 self._inputs[i_name] = self._nodes[i_name]
-
         # Create a function from our output expression and all input variables.
         func = _function.Function([v for k, v in self._inputs.items()], outputs)
-
         return IRModule.from_expr(func), self._params
 
     def _parse_value_proto(self, value_proto):
@@ -3803,7 +3773,6 @@ class GraphProto:
         """Convert ONNX operator into a Relay operator.
         The converter must specify conversions explicitly for incompatible name, and
         apply handlers to operator attributes.
-
         Parameters
         ----------
         op_name : str
@@ -3814,7 +3783,6 @@ class GraphProto:
             Dict of operator attributes
         opset : int
             Opset version
-
         Returns
         -------
         sym : tvm.relay.function.Function
@@ -3827,7 +3795,6 @@ class GraphProto:
             sym = convert_map[op_name](inputs, attrs, self._params)
         else:
             raise NotImplementedError("Operator {} not implemented.".format(op_name))
-
         return sym
 
     def _fix_outputs(self, op_name, outputs):
@@ -3844,48 +3811,39 @@ class GraphProto:
 
 def from_onnx(model, shape=None, dtype="float32", opset=None, freeze_params=False):
     """Convert a ONNX model into an equivalent Relay Function.
-
     ONNX graphs are represented as Python Protobuf objects.
     The companion parameters will be handled automatically.
     However, the input names from onnx graph is vague, mixing inputs and
     network weights/bias such as "1", "2"...
     For convenience, we rename the `real` input names to "input_0",
     "input_1"... And renaming parameters to "param_0", "param_1"...
-
     By default, ONNX defines models in terms of dynamic shapes. The ONNX importer
     retains that dynamism upon import, and the compiler attempts to convert the
     model into a static shapes at compile time. If this fails, there may still
     be dynamic operations in the model. Not all TVM kernels currently support
     dynamic shapes, please file an issue on discuss.tvm.apache.org
     if you hit an error with dynamic kernels.
-
     Parameters
     ----------
     model : protobuf object
         ONNX ModelProto after ONNX v1.1.0
-
     shape : dict of str to tuple, optional
         The input shape to the graph
-
     dtype : str or dict of str to str
         The input types to the graph
-
     opset : int, optional
         Override to autodetected opset.
         This can be helpful for some testing.
-
     freeze_params: bool
         If this parameter is true, the importer will take any provided
         onnx input values (weights, shapes, etc) and embed them into the relay model
         as Constants instead of variables. This allows more aggressive optimizations
         at compile time and helps in making models static if certain inputs represent
         attributes relay would traditionally consider compile-time constants.
-
     Returns
     -------
     mod : tvm.IRModule
         The relay module for compilation
-
     params : dict of str to tvm.nd.NDArray
         The parameter dict to be used by relay
     """

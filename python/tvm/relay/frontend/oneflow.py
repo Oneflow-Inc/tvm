@@ -32,24 +32,14 @@ from .common import (
 
 __all__ = ["from_oneflow"]
 
-FLOW_2_NP_DTYPE = {
-    2: np.float32,
-    3: np.float64,
-    6: np.int64,
-    5: np.int32,
-    4: np.int8,
-    7: np.uint8,
-    9: np.float16
-}
-
-NP_2_TVM_DTYPE = {
-    np.float16: "float16",
-    np.float32: "float32",
-    np.float64: "float64",
-    np.int64: "int64",
-    np.int32: "int32",
-    np.int8: "int8",
-    np.uint8: "uint8",
+FLOW_2_STR_DTYPE = {
+    2: "float32",
+    3: "float64",
+    6: "int64",
+    5: "int32",
+    4: "int8",
+    7: "uint8",
+    9: "float16"
 }
 
 _identity_list = []
@@ -265,11 +255,12 @@ class Pool(OneFlowOpConverter):
         input_dtype = infer_type(data).checked_type.dtype
         ndim = len(input_shape)
 
-        # TODO
         if attrs["data_format"] == "channels_first":
-            attrs["data_format"] = "NCHW"
+            attrs["layout"] = "NCHW"
+        # TODO
         else:
-            attrs["data_format"] = "NHMC"
+            pass
+        attrs.pop("data_format")
 
         if "padding" in attrs:
             if attrs["padding"].lower() in ("same_upper", "same_lower"):
@@ -299,13 +290,11 @@ class Pool(OneFlowOpConverter):
                         pad_value=pad_val,
                         mode=attrs["padding"].upper(),
                     )
-            
             elif attrs["padding"].lower() == "valid":
                 attrs["pads"] = tuple([0 for _ in range(ndim - 2)])
             elif attrs["padding"].lower() == "same":
                 # TODO
                 pass
-        
             else:
                 msg = 'Value {} in attribute "padding" of operator {} is invalid.'
                 raise tvm.error.OpAttributeInvalid(msg.format(attrs["padding"], cls.name))
@@ -315,21 +304,18 @@ class Pool(OneFlowOpConverter):
             attrs["padding_before"] = [0, 0]
         if "padding_after" not in attrs:
             attrs["padding_after"] = [0, 0]
-            attrs["pads"] = [attrs["padding_after"][0], attrs["padding_before"][0],
-                             attrs["padding_after"][1], attrs["padding_before"][1]]
+        attrs["pads"] = [attrs["padding_after"][0], attrs["padding_before"][0],
+                         attrs["padding_after"][1], attrs["padding_before"][1]]
         attrs.pop("padding_before")
         attrs.pop("padding_after")
 
         out = AttrCvt(
             op_name=cls.name,
             transforms={
-                "kernel_shape": "pool_size",
                 "pads": ("padding", 0),
                 "dilations": ("dilation", 1),
             },
-            # TODO: NCHW与其他数据之间的转换
             ignores=["storage_order", "data_format"],
-            # TODO: ??? transforms doesn't work ???
             # custom_check=dimension_constraint(),
         )([data], attrs, params)
 
@@ -343,12 +329,15 @@ class Conv(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         # Use shape of input to determine convolution type.
-        data = inputs[0]
-        kernel = inputs[1]
+        for i in inputs:
+            if "-in" not in str(i):
+                kernel = i
+            else:
+                data = i
         input_shape = infer_shape(data)
         ndim = len(input_shape)
 
-        kernel_type = infer_type(inputs[1])
+        kernel_type = infer_type(kernel)
         kernel_shapes = [get_const_tuple(kernel_type.checked_type.shape)]
 
         if "kernel_size" not in attrs:
@@ -376,8 +365,7 @@ class Conv(OneFlowOpConverter):
             attrs.pop("padding")
 
         if "dilation_rate" in attrs:
-            # TODO: transforms doesn't work
-            attrs["dilations"] = list(attrs["dilation_rate"])
+            attrs["dilation"] = list(attrs["dilation_rate"])
             attrs.pop("dilation_rate")
 
         group_conv1d = False
@@ -391,28 +379,22 @@ class Conv(OneFlowOpConverter):
             attrs["kernel_size"] = [1] + list(attrs["kernel_size"])
             if "strides" in attrs:
                 attrs["strides"] = [1] + list(attrs["strides"])
-            if "dilation_rate" in attrs:
-                attrs["dilations"] = [1] + list(attrs["dilation_rate"])
-                attrs.pop("dilation_rate")
+            if "dilations" in attrs:
+                attrs["dilation"] = [1] + list(attrs["dilation"])
 
-        if "padding_before" not in attrs:
-            attrs["padding_before"] = [0, 0]
-        if "padding_after" not in attrs:
-            attrs["padding_after"] = [0, 0]
-        attrs["pads"] = [attrs["padding_after"][0], attrs["padding_before"][0],
-                         attrs["padding_after"][1], attrs["padding_before"][1]]
-        attrs.pop("padding_before")
-        attrs.pop("padding_after")
+        if "padding_before" in attrs:
+            attrs["padding"] = attrs["padding_before"]
+            attrs.pop("padding_before")
+        if "padding_after" in attrs:
+            attrs["padding"] = attrs["padding_after"]
+            attrs.pop("padding_after")
 
         out = AttrCvt(
             op_name=cls.name,
             transforms={
-                "kernel_shape": "kernel_size",
-                "pads": ("padding", 0),
                 "group": ("groups", 1),
             },
-            # TODO: conv2d() got an unexpected keyword argument 'dilations' ???
-            ignores=["data_format", "filters", "dilations"],
+            ignores=["data_format", "filters"],
             # custom_check=dimension_constraint(),
         )([data, kernel], attrs, params)
 
@@ -420,7 +402,6 @@ class Conv(OneFlowOpConverter):
         if group_conv1d:
             out = _op.squeeze(out, axis=[2])
 
-        # oneflow里面bias-add是一个专门的一个op, 用Add替换
         return out
 
 
@@ -450,7 +431,7 @@ class InstanceNorm(OneFlowOpConverter):
 
 class MatMul(OneFlowOpConverter):
     """Operator converter for MatMul."""
-    # TODO: 这个应该对应的是onnx.py中的GEMM
+    # 这个应该对应的是onnx.py中的GEMM
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
@@ -488,11 +469,23 @@ class Elemwise(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
         op_name = cls.name
-        conv_ops = ["conv2d", "conv2d_transpose"]
-        if attrs.get("broadcast", 0) and any(x in str(inputs[0]) for x in conv_ops):
-            # TODO(zhreshold): remove hard coded infershape
-            axis = int(attrs.get("axis", 0))
-            inputs[1] = _op.expand_dims(inputs[1], axis=axis, num_newaxis=2)
+        """
+        true_names和false_names参数解释：
+        1. add-b存在，意味着该节点的参数为外部模型导入
+           如：free_var %conv2-bias_add-b: Tensor[(64), float32];
+           应该进行expand_dims
+        2. -in存在，意味着该节点的参数为前面的计算图计算好的结果
+           不应该进行expand_dims
+        """
+        true_names = ["bias_add-b"]
+        false_names = ["-in"]
+
+        for i in range(2):
+            T_NAMES = any(x in str(inputs[i]) for x in true_names)
+            F_NAMES =any(x in str(inputs[i]) for x in false_names)
+            if T_NAMES and not F_NAMES:
+                axis = int(attrs.get("axis", 0))
+                inputs[i] = _op.expand_dims(inputs[i], axis=axis, num_newaxis=2)
         return get_relay_op(op_name)(*inputs)
 
 
@@ -502,7 +495,7 @@ class Add(Elemwise):
     name = "add"
 
 
-class MaxPool(Pool):
+class MaxPool2d(Pool):
     """Operator converter for MaxPool"""
 
     name = "max_pool2d"
@@ -594,7 +587,7 @@ def get_convert_map():
         "relu": Renamer("relu"),
         # defs/nn
         "conv2d": Conv2d.get_converter(),
-        "max_pool_2d": MaxPool.get_converter(),
+        "max_pool_2d": MaxPool2d.get_converter(),
         "dropout": Dropout.get_converter(),
         # defs/tensor
         "matmul": MatMul.get_converter(), # TODO: 究竟是matmul还是gemm
@@ -737,27 +730,12 @@ class OneflowGraph(object):
         """
         self._input_path_2_name = {v: k for k, v in self._input_name_2_path.items()}
 
-        self._output_path = {}
+        self._output_path_2_name = {}
         for node_name in nodes:
             node = nodes[node_name]
             if is_output_op(node):
                 output_path = os.path.join(model_dir_path, getattr(node.return_conf, "in"))
-                self._output_path[node.name] = output_path
-
-        # print("output path: -------------")
-        # for n in self._output_path:
-        #     print(n, self._output_path[n])
-        #     print()
-
-        # print("known param: -------------")
-        # for n in self._params:
-        #     print(n)
-        #     print()
-
-        # print("known shape: -------------")
-        # for n in self._shape:
-        #     print(n, self._shape[n])
-        #     print()
+                self._output_path_2_name[output_path] = node_name
 
 
     def _parse_input(self, node, model_dir_path):
@@ -806,7 +784,7 @@ class OneflowGraph(object):
                     self._nodes[node_name] = new_var(
                         node_name, 
                         shape=tuple(node.input_conf.blob_conf.shape.dim),
-                        dtype=NP_2_TVM_DTYPE[FLOW_2_NP_DTYPE[node.input_conf.blob_conf.data_type]]
+                        dtype=FLOW_2_STR_DTYPE[node.input_conf.blob_conf.data_type]
                     )
                 self._inputs[node_name] = self._nodes[node_name]
 
@@ -839,6 +817,7 @@ class OneflowGraph(object):
             if is_user_op(node):
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
+                print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -866,27 +845,18 @@ class OneflowGraph(object):
                     
                     if node_output_path in self._input_path_2_name:
                         node_outputs.append(self._input_path_2_name[node_output_path])
+                    elif node_output_path in self._output_path_2_name:
+                        node_outputs.append(self._output_path_2_name[node_output_path])
                     else:
                         warnings.warn("{} is not in input_path".format(node_output_path))
 
                 node_outputs = fix_outputs(op_name, node_outputs)
-                # TODO: night（fix ops)
 
-                print("node output: ---------")
-                print(node_outputs)
-                print()
-
-                op_attr["tvm_custom"] = {}
-                # onnx.py这里实际的name是空，没有看明白
-                # 原因: .common.py line 405: ignore 'tvm_custom' always
-                # TODO: 还没有实验删掉这句话会有什么影响
-                op_attr["tvm_custom"]["name"] = ''
-                op_attr["tvm_custom"]["num_outputs"] = len(node_outputs)
-
-                # 转换核心语句
+                # 转换
                 op = self._convert_operator(op_name, node_inputs, op_attr)
+                print(op)
 
-                # 判断网络有多少个输出，并相应做出调整
+                # 判断节点有多少个输出，并相应做出调整
                 if not isinstance(op, _expr.TupleWrapper):
                     outputs_num = 1
                 else:
@@ -915,25 +885,21 @@ class OneflowGraph(object):
                 print()
 
         print("convert ends.")
+
+        # step 4: get the outputs
         outputs = []
         for node_name in nodes:
             node = nodes[node_name]
-            if is_user_op(node):
-                for output_name in node.user_conf.output:
-                    node_output_name = str(node_name) + '-' + str(output_name)
-
-                    node_output_path = getattr(node.user_conf.output[output_name], 's')
-                    if len(node_output_path) == 1:
-                        node_output_path = os.path.join(model_dir_path, node_output_path[0])
-                    else:
-                        pass
-
-                    if node_output_name in self._outputs or node_output_path in self._output_path:
-                        outputs.append(self._nodes[node_output_name])
+            if is_output_op(node):
+                if node_name in self._nodes:
+                    outputs.append(self._nodes[node_name])
 
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
+        print("outputs: -----------")
+        print(outputs)
+        print()
 
-        # 转换为relay IR
+        # step 5: get the relay IR
         free_vars = analysis.free_vars(outputs)
 
         nodes = {v: k for k, v in self._nodes.items()}
@@ -981,7 +947,7 @@ class OneflowGraph(object):
         return sym
 
 
-def from_oneflow(eval_job, model_dir_path, shape=None, dtype=None):
+def from_oneflow(eval_job, model_dir_path, shapes=None, dtypes=None):
     """
     Parameters
     ----------
@@ -1022,6 +988,14 @@ def from_oneflow(eval_job, model_dir_path, shape=None, dtype=None):
     nodes = {}
     shape = {}
     dtype = {}
+
+    if shapes is not None:
+        for key in shapes:
+            shape[key] = shapes[key]
+    if dtypes is not None:
+        for key in dtypes:
+            dtype[key] = dtypes[key]
+
     for job in job_set.job:
         if job.job_conf.job_name == eval_job.__name__:
             for node in job.net.op:
@@ -1033,7 +1007,7 @@ def from_oneflow(eval_job, model_dir_path, shape=None, dtype=None):
                 node_shape = tuple(lbd.shape.dim)
                 node_dtype = lbd.data_type
                 shape[node_path] = node_shape
-                dtype[node_path] = NP_2_TVM_DTYPE[FLOW_2_NP_DTYPE[node_dtype]]
+                dtype[node_path] = FLOW_2_STR_DTYPE[node_dtype]
 
     g = OneflowGraph(shape, dtype, nodes, model_dir_path)
 
