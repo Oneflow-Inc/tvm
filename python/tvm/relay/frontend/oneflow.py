@@ -685,6 +685,7 @@ class OneflowGraph(object):
         self._num_input = 0
         self._num_param = 0
         self._input_names = []
+        self._input_name_2_path = {}
         self._model_array = {}
         self._outputs = []
         self._shape = shape
@@ -711,6 +712,8 @@ class OneflowGraph(object):
                     else:
                         pass
 
+                    self._input_name_2_path[node_init_name] = node_input_path
+
                     for node_input_name in self._model_array:
                         node_p = self._model_array[node_input_name]
 
@@ -722,6 +725,17 @@ class OneflowGraph(object):
                                 shape=node_array.shape,
                                 dtype=str(node_array.dtype)
                             )
+        """
+        node_outputs的名字不会直接出现在node.user_conf.input里面
+        所以在构建计算图的时候会导致层与层之间的联系被斩断
+        修补步骤：
+        1. 找到此时node_outputs对应的路径
+        2. 将该路径与node.user_conf.input里面的对应起来，也就是说，需要在__init__的时候创建一个
+            所有node.user_conf.input与其路径的dict
+        3. dict反转，找到与node_outputs同一路径的node_input(下句)
+        4. 在output的new_var的时候将node_outputs的名字换成找到的node_input的名字
+        """
+        self._input_path_2_name = {v: k for k, v in self._input_name_2_path.items()}
 
         self._output_path = {}
         for node_name in nodes:
@@ -840,7 +854,6 @@ class OneflowGraph(object):
                     else:
                         node_inputs[node_input_name] = None
 
-                # node_outputs需要的都在_parse_input中被处理了
                 node_outputs = []
                 for output_name in node.user_conf.output:
                     node_output_name = str(node_name) + '-' + str(output_name)
@@ -850,18 +863,15 @@ class OneflowGraph(object):
                         node_output_path = os.path.join(model_dir_path, node_output_path[0])
                     else:
                         pass
-                    node_outputs.append(node_output_name)
+                    
+                    if node_output_path in self._input_path_2_name:
+                        node_outputs.append(self._input_path_2_name[node_output_path])
+                    else:
+                        warnings.warn("{} is not in input_path".format(node_output_path))
 
                 node_outputs = fix_outputs(op_name, node_outputs)
-                # TODO: night（and op: 'FC')
-                # node_outputs的名字不会直接出现在node.user_conf.input里面
-                # 所以在构建计算图的时候会导致层与层之间的联系被斩断
-                # 需要干的事情就是
-                # 1. 找到此时node_outputs对应的路径
-                # 2. 将该路径与node.user_conf.input里面的对应起来，也就是说，需要在__init__的时候创建一个
-                #    所有node.user_conf.input与其路径的dict
-                # 3. dict反转，找到与node_outputs同一路径的node_input
-                # 4. 在下面new_var的时候将node_outputs的名字换成找到的node_input的名字
+                # TODO: night（fix ops)
+
                 print("node output: ---------")
                 print(node_outputs)
                 print()
