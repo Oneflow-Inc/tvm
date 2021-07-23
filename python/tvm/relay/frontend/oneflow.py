@@ -322,6 +322,42 @@ class Pool(OneFlowOpConverter):
         return out
 
 
+class GlobalAveragePool(OneFlowOpConverter):
+    """Operator converter for GlobalAveragePool"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        rank = len(infer_shape(inputs[0]))
+        if rank == 3:
+            return _op.nn.global_avg_pool1d(inputs[0])
+        if rank == 4:
+            return _op.nn.global_avg_pool2d(inputs[0])
+        if rank == 5:
+            return _op.nn.global_avg_pool3d(inputs[0])
+        raise NotImplementedError(
+            "Global average pooling is only implemented for 1D, 2D, and 3D kernels, got %dD."
+            % (rank - 2),
+        )
+
+
+class GlobalMaxPool(OneFlowOpConverter):
+    """Operator converter for GlobalMaxPool"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        rank = len(infer_shape(inputs[0]))
+        if rank == 3:
+            return _op.nn.global_max_pool1d(inputs[0])
+        if rank == 4:
+            return _op.nn.global_max_pool2d(inputs[0])
+        if rank == 5:
+            return _op.nn.global_max_pool3d(inputs[0])
+        raise NotImplementedError(
+            "Global max pooling is only implemented for 1D, 2D, and 3D kernels, got %dD."
+            % (rank - 2),
+        )
+
+
 class Conv(OneFlowOpConverter):
     """Operator converter for Conv."""
     name = ""
@@ -405,6 +441,75 @@ class Conv(OneFlowOpConverter):
         return out
 
 
+class ConvTranspose(OneFlowOpConverter):
+    """Operator converter for ConvTranspose."""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        # get number of channels
+        for i in inputs:
+            if "-in" not in str(i):
+                kernel = i
+            else:
+                data = i
+        out_type = infer_type(kernel)
+        out_shapes = [get_const_tuple(out_type.checked_type.shape)]
+        attrs["channels"] = attrs.get("filters", 1)
+        attrs["groups"] = attrs.get("group", 1)
+
+        input_shape = infer_shape(data)
+        ndim = len(input_shape)
+
+        kernel_type = infer_type(kernel)
+        kernel_shapes = [get_const_tuple(kernel_type.checked_type.shape)]
+
+        if "kernel_size" not in attrs:
+            attrs["kernel_size"] = kernel_shapes[0][2:]
+
+        if "padding" in attrs:
+            if attrs["padding"].lower() in ("same_upper", "same_lower"):
+                # Warning: Convolution does not yet support dynamic shapes,
+                # one will need to run dynamic_to_static on this model after import
+                data = autopad(
+                    data,
+                    attrs.get("strides", [1] * (ndim - 2)),
+                    attrs["kernel_size"],
+                    attrs.get("dilation_rate", [1] * (ndim - 2)),
+                    ndim,
+                    mode=attrs["padding"].upper(),
+                )
+            elif attrs["padding"].lower() == "vaild":
+                attrs["pads"] = [0 for i in range(ndim - 2)]
+            elif attrs["padding"].lower() == "same":
+                pass
+            else:
+                msg = 'Value {} in attribute "padding" of operator Conv is invalid.'
+                raise tvm.error.OpAttributeInvalid(msg.format(attrs["padding"]))
+            attrs.pop("padding")
+
+        if "dilation_rate" in attrs:
+            attrs["dilation"] = list(attrs["dilation_rate"])
+            attrs.pop("dilation_rate")
+
+        if "padding_before" in attrs:
+            attrs["padding"] = attrs["padding_before"]
+            attrs.pop("padding_before")
+        if "padding_after" in attrs:
+            attrs["padding"] = attrs["padding_after"]
+            attrs.pop("padding_after")
+
+        out = AttrCvt(
+            op_name=dimension_picker("conv", "_transpose"),
+            transforms={
+                "group": ("groups", 1),
+            },
+            disables=["output_shape", "filters"],
+            # custom_check=dimension_constraint(),
+        )([data, kernel], attr, params)
+
+        return out
+
+
 class Conv2d(Conv):
     """Operator converter for Conv2d."""
     name = "conv2d"
@@ -427,6 +532,27 @@ class InstanceNorm(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         return AttrCvt(op_name="instance_norm")(inputs, attrs, params)
+
+    
+class Flatten(OneFlowOpConverter):
+    """Operator converter for Flatten."""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        axis = attrs.get("axis", 1)
+        ishape = _op.shape_of(inputs[0])
+        ndim = infer_shape(ishape)[0]
+        if axis < 0:
+            axis = axis + ndim
+
+        if axis == 1:
+            out = _op.nn.batch_flatten(inputs[0])
+        else:
+            pre_shape = _op.prod(_op.strided_slice(ishape, [0], [axis], [1]), keepdims=True)
+            post_shape = _op.prod(_op.strided_slice(ishape, [axis], [ndim], [1]), keepdims=True)
+            newshape = _op.concatenate([pre_shape, post_shape], axis=0)
+            out = _op.reshape(inputs[0], newshape)
+        return out
 
 
 class MatMul(OneFlowOpConverter):
@@ -515,8 +641,8 @@ class Softmax(OneFlowOpConverter):
     """Operator converter for Softmax."""
 
     @classmethod
-    def _impl_v1(cls, inputs, attr, params):
-        axis = attr.get("axis", 1)
+    def _impl_v1(cls, inputs, attrs, params):
+        axis = attrs.get("axis", 1)
         ndim = len(infer_shape(inputs[0]))
         if axis < 0:
             axis += ndim
@@ -528,11 +654,11 @@ class Softmax(OneFlowOpConverter):
 
 
 class LogSoftmax(OneFlowOpConverter):
-    """Operator converter for Softmax."""
+    """Operator converter for LogSoftmax."""
 
     @classmethod
-    def _impl_v1(cls, inputs, attr, params):
-        axis = attr.get("axis", 1)
+    def _impl_v1(cls, inputs, attrs, params):
+        axis = attrs.get("axis", 1)
         ndim = len(infer_shape(inputs[0]))
         if axis < 0:
             axis += ndim
@@ -545,11 +671,26 @@ class LogSoftmax(OneFlowOpConverter):
 
 
 class Dropout(OneFlowOpConverter):
+    """Operator converter for Dropout."""
 
     @classmethod
-    def _impl_v1(cls, inputs, attr, params):
+    def _impl_v1(cls, inputs, attrs, params):
         out = AttrCvt("dropout", {"ratio": "rate"}, ignores=["is_test"])
+        return out
 
+    
+class PReLU(OneFlowOpConverter):
+    """Operator converter for PReLU."""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        # TODO: need to know which one is the input
+        assert len(inputs) == 2, "PReLU need 2 inputs, but {} given".format(len(inputs))
+        input_shape = shape_of(inputs[0])
+        alpha = _op.broadcast_to_like(inputs[1], inputs[0])
+        alpha = _op.reshape(alpha, [-1])
+        output = _op.nn.prelu(_op.reshape(inputs[0], [-1]), alpha, axis=0)
+        out = _op.reshape(output, input_shape)
         return out
 
 
@@ -579,6 +720,7 @@ def get_convert_map():
         # defs/activation
         "sigmoid": Renamer("sigmoid"),
         "relu": Renamer("relu"),
+        "prelu": PReLU.get_converter(),
         # defs/nn
         "conv2d": Conv2d.get_converter(),
         "max_pool_2d": MaxPool2d.get_converter(),
@@ -791,11 +933,9 @@ class OneflowGraph(object):
         if not freeze_params:
             for node_init_name in user_input:
                 # 我们应该让用户定义如: conv1-in的输入，即第一层网络层的名字 + '-in'
-                if node_init_name not in self._nodes:
-                    raise KeyError("the key of user_input should be: \
-                        name of network layer 1(like \'conv1\') + \'-in\'")
+                if "-in" not in node_init_name:
+                    raise KeyError("the key of user_input should be: name of network layer 1(like \'conv1\') + \'-in\'")
                 else:
-                    self._nodes.pop[node_init_name]
                     self._nodes[node_init_name] = new_var(
                         node_init_name,
                         shape=user_input[node_init_name]["shape"],
@@ -830,9 +970,13 @@ class OneflowGraph(object):
         for node_name in nodes:
             node = nodes[node_name]
             if is_user_op(node):
+                # 如果有用户自定义的，跳过
+                if node_name in self._inputs:
+                    continue
+
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
-                print(op_name, op_attr)
+                # print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -910,9 +1054,6 @@ class OneflowGraph(object):
                     outputs.append(self._nodes[node_name])
 
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
-        print("outputs: -----------")
-        print(outputs)
-        print()
 
         # step 5: get the relay IR
         free_vars = analysis.free_vars(outputs)
@@ -920,14 +1061,29 @@ class OneflowGraph(object):
         nodes = {v: k for k, v in self._nodes.items()}
         free_vars = [nodes[var] for var in free_vars]
 
+        # step 6: make sure the '-in' is the first in self._inputs
         # free_vars都应该存储到self._inputs里头
         for free_var in free_vars:
             if free_var not in self._inputs:
                 self._inputs[free_var] = self._nodes[free_var]
 
-        # Create a function from our output expression and all input variables.
-        func = _function.Function([v for _, v in self._inputs.items()], outputs)
-        print(func)
+        input_names = list(self._inputs.keys())
+        for i in range(len(input_names)):
+            if i != 0 and '-in' in input_names[i]:
+                str_buffer = copy.deepcopy(input_names[i])
+                del input_names[i]
+                input_names.insert(0, str_buffer)
+                break
+
+        self._sort_inputs = {}
+        for input_name in input_names:
+            if input_name in self._inputs:
+                self._sort_inputs[input_name] = self._inputs[input_name]
+            else:
+                raise IndexError("{} is not in self._inputs".format(input_name))
+
+        # step 7: create a function from our output expression and all input variables.
+        func = _function.Function([v for _, v in self._sort_inputs.items()], outputs)
 
         return IRModule.from_expr(func), self._params
 
@@ -972,7 +1128,7 @@ def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
         用户指定输入为: %Input_0: Tensor[(1, 1, 28, 28), float32]
         若freeze_params打开，则conv1-in为计算图输入，而非Input_0
     user_input: dict
-        用户指定的计算图输入信息
+        用户指定的计算图节点信息
         {
             node1_name: 
             {
@@ -982,6 +1138,7 @@ def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
             }
             ...
         }
+    注意：如果用户需要指定的信息需要完整
 
     Returns
     -------
@@ -997,16 +1154,15 @@ def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
         oneflow.config.enable_legacy_model_io(False)
 
         if 'snapshot_done' not in os.listdir(model_dir_path):
-            raise IndexError("\'snapshot_name\' is not in the model path, \
-            please determine whether the model has been trained")
+            raise IndexError("'snapshot_name' is not in the model path, please determine whether the model has been trained")
 
     except ImportError:
         raise ImportError("please check that OneFlow is installed")
 
     if not freeze_params and user_input is None:
-        raise ValueError("if you want to specify graph input, please give the \'user_input\'")
-    if not freeze_params and user_input is not None:
-        warnings.warn("\'user_input\' will not work, please check the \'freeze_params\'")
+        raise ValueError("if you want to specify graph input, please give the 'user_input'")
+    if freeze_params and user_input is not None:
+        warnings.warn("'user_input' will not work, please check the 'freeze_params'")
 
     # 获取job函数的所有可能信息，用于得到用户的job，导出计算图
     job_set = flow.get_job_set()
@@ -1017,6 +1173,7 @@ def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
     dtype = {}
 
     # this will spend a long time
+    # TODO: only support 0.4.0
     for job in job_set.job:
         if job.job_conf.job_name == eval_job.__name__:
             for node in job.net.op:
@@ -1035,6 +1192,6 @@ def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
     # Use the graph proto as a scope so that ops can access other nodes if needed.
     mod, params = g.from_oneflow(
             nodes=nodes, model_dir_path=model_dir_path, 
-            freeze_params=freeze_params, 
+            freeze_params=freeze_params, user_input=user_input
         )
     return mod, params
