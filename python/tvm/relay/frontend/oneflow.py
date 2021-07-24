@@ -243,7 +243,6 @@ class OneFlowOpConverter:
         converter, which should be `_impl_vx`. Number x is the biggest
             number smaller than or equal to opset belongs to all support versions.
         """
-        # TODO: version用来控制是用哪个函数
         version = 1
         if hasattr(cls, "_impl_v{}".format(version)):
             return getattr(cls, "_impl_v{}".format(version))
@@ -261,6 +260,7 @@ class Pool(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         data = inputs[0]
         input_shape = infer_shape(data)
+        # print("pool inputs shape: {}".format(input_shape))
         input_dtype = infer_type(data).checked_type.dtype
         ndim = len(input_shape)
 
@@ -273,13 +273,13 @@ class Pool(OneFlowOpConverter):
 
         if "padding" in attrs:
             if attrs["padding"].lower() in ("same_upper", "same_lower"):
-                if cls.name == "avg_pool":
+                if "avg_pool" in str(cls.name):
                     pad_tuple = []
                     for axis in range(len(input_shape) - 2):
                         axis_shape = input_shape[2 + axis]
                         stride = attrs.get("strides", [1] * ndim)[axis]
                         kernel = attrs["pool_size"][axis]
-                        pad = get_pad_pair(axis_shape, kernel, stride, attrs["padding"])
+                        pad = get_pad_pair(axis_shape, kernel, stride, attrs["padding"].upper())
                         pad_tuple.append(pad)
                     pad_tuple = tuple([val for pair in zip(*pad_tuple) for val in pair])
                     attrs["pads"] = pad_tuple
@@ -529,9 +529,33 @@ class BatchNorm(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
+        # sort the inputs
+        sorted_inputs = copy.deepcopy(inputs)
+        for i in range(len(inputs)):
+            IN_NAMES = '-in' in str(inputs[i])
+            if IN_NAMES:
+                sorted_inputs[0] = inputs[i]
+            elif 'gamma' in str(inputs[i]) and not IN_NAMES:
+                sorted_inputs[1] = inputs[i]
+            elif 'beta' in str(inputs[i]) and not IN_NAMES:
+                sorted_inputs[2] = inputs[i]
+            elif 'mean' in str(inputs[i]) and not IN_NAMES:
+                sorted_inputs[3] = inputs[i]
+            elif 'variance' in str(inputs[i]) and not IN_NAMES:
+                sorted_inputs[4] = inputs[i]
+
+        axis = 3
+        if "data_format" in attrs:
+            if attrs["data_format"] == "channel_first":
+                attrs.pop("axis")
+                axis = 1
+
         out = AttrCvt(
-            op_name="batch_norm", ignores=["spatial", "is_test", "consumed_inputs", "momentum"]
-        )(inputs, attrs, params)
+            op_name="batch_norm", 
+            ignores=["training"],
+            extras={"axis": axis},
+            disables=["momentum"]
+        )(sorted_inputs, attrs, params)
         return out[0]
 
 
@@ -614,6 +638,7 @@ class Add(OneFlowOpConverter):
     """Operator converter for Add."""
 
     name = "add"
+    # TODO: 对用户的网络层命名有要求，conv层名字必须带conv，其他层不得带conv
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
@@ -646,10 +671,10 @@ class MaxPool2d(Pool):
     name = "max_pool2d"
 
 
-class AveragePool(Pool):
+class AveragePool2d(Pool):
     """Operator converter for AveragePool."""
 
-    name = "avg_pool"
+    name = "avg_pool2d"
 
 
 class Reshape(OneFlowOpConverter):
@@ -749,7 +774,9 @@ def get_convert_map():
         # defs/nn
         "conv2d": Conv2d.get_converter(),
         "max_pool_2d": MaxPool2d.get_converter(),
+        "avg_pool_2d": AveragePool2d.get_converter(),
         "dropout": Dropout.get_converter(),
+        "normalization": BatchNorm.get_converter(),
         # defs/tensor
         "matmul": MatMul.get_converter(),
         # defs/others
@@ -899,7 +926,6 @@ class OneflowGraph(object):
                 output_path = os.path.join(model_dir_path, getattr(node.return_conf, "in"))
                 self._output_path_2_name[output_path] = node_name
 
-
     def _parse_input(self, node, model_dir_path):
         for input_name in node.user_conf.input:
             node_input_name = node.name + '-' + input_name
@@ -1001,7 +1027,7 @@ class OneflowGraph(object):
 
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
-                # print(op_name, op_attr)
+                print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -1032,13 +1058,13 @@ class OneflowGraph(object):
                     elif node_output_path in self._output_path_2_name:
                         node_outputs.append(self._output_path_2_name[node_output_path])
                     else:
-                        warnings.warn("{} is not in input_path".format(node_output_path))
+                        warnings.warn("{} is not in known path".format(node_output_path))
 
                 node_outputs = fix_outputs(op_name, node_outputs)
 
                 # 转换
                 op = self._convert_operator(op_name, node_inputs, op_attr)
-                # print(op)
+                print(op)
 
                 # 判断节点有多少个输出，并相应做出调整
                 if not isinstance(op, _expr.TupleWrapper):
@@ -1066,7 +1092,7 @@ class OneflowGraph(object):
                     for k, i in zip(list(node_outputs), range(len(node_outputs))):
                         self._outputs.append(k)
                         self._nodes[k] = op[i]
-                # print()
+                print()
 
         print("convert ends.")
 
