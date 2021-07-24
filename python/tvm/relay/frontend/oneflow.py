@@ -211,9 +211,18 @@ def autopad(
     return _op.nn.pad(data, fold_constant(pad), pad_value, pad_type)
 
 
-def dimension_constraint():
+def dimension_constraint_conv():
     def _dim_check(attrs):
-        if len(attrs["kernel_shape"]) in [1, 2, 3]:
+        if len(attrs["kernel_size"]) in [1, 2, 3]:
+            return True
+        return False
+
+    return _dim_check, "Only 1d, 2d and 3d kernel supported."
+
+
+def dimension_constraint_pool():
+    def _dim_check(attrs):
+        if len(attrs["pool_size"]) in [1, 2, 3]:
             return True
         return False
 
@@ -316,7 +325,7 @@ class Pool(OneFlowOpConverter):
                 "dilations": ("dilation", 1),
             },
             ignores=["storage_order", "data_format"],
-            # custom_check=dimension_constraint(),
+            custom_check=dimension_constraint_pool(),
         )([data], attrs, params)
 
         return out
@@ -431,7 +440,7 @@ class Conv(OneFlowOpConverter):
                 "group": ("groups", 1),
             },
             ignores=["data_format", "filters"],
-            # custom_check=dimension_constraint(),
+            custom_check=dimension_constraint_conv(),
         )([data, kernel], attrs, params)
 
         # If this was a group_conv1d, squish output back to NCW.
@@ -504,7 +513,7 @@ class ConvTranspose(OneFlowOpConverter):
                 "group": ("groups", 1),
             },
             disables=["output_shape", "filters"],
-            # custom_check=dimension_constraint(),
+            custom_check=dimension_constraint_conv(),
         )([data, kernel], attr, params)
 
         return out
@@ -557,37 +566,52 @@ class Flatten(OneFlowOpConverter):
 
 class MatMul(OneFlowOpConverter):
     """Operator converter for MatMul."""
-    # 这个应该对应的是onnx.py中的GEMM
+    # 这个应该对应的是onnx.py中的GEMM, 仅支持2个输入
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 3 or len(inputs) == 2, "Gemm op take 2 or 3 inputs, {} given".format(
+        assert len(inputs) == 2, "Gemm op take 2 inputs, {} given".format(
             len(inputs)
         )
-        dtype = infer_type(inputs[0]).checked_type.dtype
-        # Y = alpha * A * B + beta * C
+        """
+        true_names和false_names参数解释：
+        1. matmul-b存在，意味着该节点的参数为外部模型导入
+           如：free_var %dense2-matmul-b: Tensor[(10, 512), float32];
+           应该作为inputs[1]
+        2. -in存在，意味着该节点的参数为前面的计算图计算好的结果
+           应该作为inputs[0]
+        """
+        true_names = ["matmul-b"]
+        false_names = ["-in"]
+        for i in range(2):
+            T_NAMES = any(x in str(inputs[i]) for x in true_names)
+            F_NAMES = any(x in str(inputs[i]) for x in false_names)
+            if T_NAMES and not F_NAMES:
+                matmul_b = inputs[i]
+            else:
+                matmul_a = inputs[i]
+
+        dtype = infer_type(matmul_a).checked_type.dtype
+        # Y = alpha * A * B
         alpha = float(attrs.get("alpha", 1.0))
-        beta = float(attrs.get("beta", 1.0))
         transA = bool(attrs.get("transpose_a", False))
         transB = bool(attrs.get("transpose_b", False))
         # get number of channels
-        channels = infer_channels(inputs[1], not transB)
+        channels = infer_channels(matmul_b, not transB)
         if transA:
-            inputs[0] = _op.transpose(inputs[0], axes=(1, 0))
+            matmul_a = _op.transpose(matmul_a, axes=(1, 0))
         if not transB:
-            inputs[1] = _op.transpose(inputs[1], axes=(1, 0))
-        inputs[0] = _op.nn.batch_flatten(inputs[0])
+            matmul_b = _op.transpose(matmul_b, axes=(1, 0))
+        matmul_a = _op.nn.batch_flatten(matmul_a)
         if alpha != 1.0:
-            inputs[0] *= _expr.const(alpha, dtype=dtype)
-        out = _op.nn.dense(inputs[0], inputs[1], units=channels)
-        if len(inputs) == 3:
-            out = out + _expr.const(beta, dtype=dtype) * inputs[2]
+            matmul_a *= _expr.const(alpha, dtype=dtype)
+        out = _op.nn.dense(matmul_a, matmul_b, units=channels)
 
         return out
 
 
 class Add(OneFlowOpConverter):
-    """A helper class for elemwise op converters."""
+    """Operator converter for Add."""
 
     name = "add"
 
@@ -611,7 +635,8 @@ class Add(OneFlowOpConverter):
             F_NAMES =any(x in str(inputs[i]) for x in false_names)
             if T_NAMES and not F_NAMES:
                 axis = int(attrs.get("axis", 0))
-                inputs[i] = _op.expand_dims(inputs[i], axis=axis, num_newaxis=2)
+                if "conv" in str(inputs[i]):
+                    inputs[i] = _op.expand_dims(inputs[i], axis=axis, num_newaxis=2)
         return get_relay_op(op_name)(*inputs)
 
 
@@ -1013,7 +1038,7 @@ class OneflowGraph(object):
 
                 # 转换
                 op = self._convert_operator(op_name, node_inputs, op_attr)
-                print(op)
+                # print(op)
 
                 # 判断节点有多少个输出，并相应做出调整
                 if not isinstance(op, _expr.TupleWrapper):
@@ -1041,7 +1066,7 @@ class OneflowGraph(object):
                     for k, i in zip(list(node_outputs), range(len(node_outputs))):
                         self._outputs.append(k)
                         self._nodes[k] = op[i]
-                print()
+                # print()
 
         print("convert ends.")
 
@@ -1194,4 +1219,6 @@ def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
             nodes=nodes, model_dir_path=model_dir_path, 
             freeze_params=freeze_params, user_input=user_input
         )
+    print(mod)
+
     return mod, params
