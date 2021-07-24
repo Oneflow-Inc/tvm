@@ -137,7 +137,7 @@ def shape_of(x, dtype="int64"):
 
 def get_pad_pair(input1d, kernel1d, stride1d, mode):
     """infer pad size"""
-    if input1d % stride1d == 0:
+    if input1d % stride1d == 0 or stride1d == 1:
         pad = max(kernel1d - stride1d, 0)
     else:
         pad = max(kernel1d - (input1d % stride1d), 0)
@@ -156,7 +156,7 @@ def autopad(
     ndim,
     pad_type="constant",
     deconv=False,
-    mode="same_upper",
+    mode="SAME_UPPER",
     pad_value=0.0,
 ):
     """
@@ -191,9 +191,10 @@ def autopad(
     # split total padding into before and after
     pad_before = _op.floor_divide(total_pad, two)
     pad_after = total_pad - pad_before
+    # print(str(pad_before) == str(pad_after))
 
     # combine
-    if "lower" in mode:
+    if "lower" in mode.lower():
         pad = _op.concatenate(
             [_op.reshape(pad_after, [-1, 1]), _op.reshape(pad_before, [-1, 1])], axis=1
         )
@@ -266,69 +267,35 @@ class Pool(OneFlowOpConverter):
 
         if attrs["data_format"] == "channels_first":
             attrs["layout"] = "NCHW"
-        # TODO
+        elif attrs["data_format"] == "channels_last":
+            attrs["layout"] = "NHWC"
         else:
-            pass
+            msg = 'Value {} of attribute "data_format" of operator Pooling ' "is not valid."
+            raise tvm.error.OpAttributeInvalid(msg.format(attrs["data_format"]))
         attrs.pop("data_format")
 
         if "padding" in attrs:
             if attrs["padding"].lower() in ("same_upper", "same_lower"):
-                if "avg_pool" in str(cls.name):
-                    pad_tuple = []
-                    for axis in range(len(input_shape) - 2):
-                        axis_shape = input_shape[2 + axis]
-                        stride = attrs.get("strides", [1] * ndim)[axis]
-                        kernel = attrs["pool_size"][axis]
-                        pad = get_pad_pair(axis_shape, kernel, stride, attrs["padding"].upper())
-                        pad_tuple.append(pad)
-                    pad_tuple = tuple([val for pair in zip(*pad_tuple) for val in pair])
-                    attrs["pads"] = pad_tuple
-                else:
-                    # Warning: Pool does not yet support dynamic shapes,
-                    # one will need to run dynamic_to_static on this model after import
-                    if "int" in input_dtype:
-                        pad_val = np.iinfo(np.dtype(input_dtype)).min
-                    else:
-                        pad_val = np.finfo(np.dtype(input_dtype)).min
-                    data = autopad(
-                        data,
-                        attrs.get("strides", [1] * (ndim - 2)),
-                        attrs["pool_size"],
-                        [1] * ndim,
-                        ndim,
-                        pad_value=pad_val,
-                        mode=attrs["padding"].upper(),
-                    )
+                pad_v = attrs.get("padding_before", [0, 0])
+                pad_h = attrs.get("padding_after", [0, 0])
+                attrs["padding"] = [pad_v[0], pad_v[1], pad_h[0], pad_h[1]]
             elif attrs["padding"].lower() == "valid":
-                attrs["pads"] = tuple([0 for _ in range(ndim - 2)])
-            elif attrs["padding"].lower() == "same":
-                # TODO
-                pass
+                attrs["padding"] = tuple([0 for _ in range(ndim - 2)])
             else:
                 msg = 'Value {} in attribute "padding" of operator {} is invalid.'
                 raise tvm.error.OpAttributeInvalid(msg.format(attrs["padding"], cls.name))
-            attrs.pop("padding")
-
-        if "padding_before" not in attrs:
-            attrs["padding_before"] = [0, 0]
-        if "padding_after" not in attrs:
-            attrs["padding_after"] = [0, 0]
-        attrs["pads"] = [attrs["padding_after"][0], attrs["padding_before"][0],
-                         attrs["padding_after"][1], attrs["padding_before"][1]]
-        attrs.pop("padding_before")
-        attrs.pop("padding_after")
 
         out = AttrCvt(
             op_name=cls.name,
             transforms={
-                "pads": ("padding", 0),
                 "dilations": ("dilation", 1),
             },
-            ignores=["storage_order", "data_format"],
+            ignores=["storage_order", "data_format", "padding_before", "padding_after"],
             custom_check=dimension_constraint_pool(),
         )([data], attrs, params)
 
         return out
+
 
 
 class GlobalAveragePool(OneFlowOpConverter):
@@ -381,37 +348,20 @@ class Conv(OneFlowOpConverter):
                 data = i
         input_shape = infer_shape(data)
         ndim = len(input_shape)
+        # print(input_shape, ndim)
 
         kernel_type = infer_type(kernel)
         kernel_shapes = [get_const_tuple(kernel_type.checked_type.shape)]
 
         if "kernel_size" not in attrs:
             attrs["kernel_size"] = kernel_shapes[0][2:]
-
-        if "padding" in attrs:
-            if attrs["padding"].lower() in ("same_upper", "same_lower"):
-                # Warning: Convolution does not yet support dynamic shapes,
-                # one will need to run dynamic_to_static on this model after import
-                data = autopad(
-                    data,
-                    attrs.get("strides", [1] * (ndim - 2)),
-                    attrs["kernel_size"],
-                    attrs.get("dilation_rate", [1] * (ndim - 2)),
-                    ndim,
-                    mode=attrs["padding"].upper(),
-                )
-            elif attrs["padding"].lower() == "vaild":
-                attrs["pads"] = [0 for i in range(ndim - 2)]
-            elif attrs["padding"].lower() == "same":
-                pass
-            else:
-                msg = 'Value {} in attribute "padding" of operator Conv is invalid.'
-                raise tvm.error.OpAttributeInvalid(msg.format(attrs["padding"]))
-            attrs.pop("padding")
-
         if "dilation_rate" in attrs:
             attrs["dilation"] = list(attrs["dilation_rate"])
             attrs.pop("dilation_rate")
+
+        pad_v = attrs.get("padding_before", [0, 0])
+        # pad_h = attrs.get("padding_after", [0, 0])
+        attrs["padding"] = [pad_v[0], pad_v[1], pad_v[0], pad_v[1]]
 
         group_conv1d = False
         if cls.name == "conv1d" and attrs.get("groups") != 1:
@@ -427,19 +377,12 @@ class Conv(OneFlowOpConverter):
             if "dilations" in attrs:
                 attrs["dilation"] = [1] + list(attrs["dilation"])
 
-        if "padding_before" in attrs:
-            attrs["padding"] = attrs["padding_before"]
-            attrs.pop("padding_before")
-        if "padding_after" in attrs:
-            attrs["padding"] = attrs["padding_after"]
-            attrs.pop("padding_after")
-
         out = AttrCvt(
             op_name=cls.name,
             transforms={
                 "group": ("groups", 1),
             },
-            ignores=["data_format", "filters"],
+            ignores=["data_format", "filters", "padding_after", "padding_before"],
             custom_check=dimension_constraint_conv(),
         )([data, kernel], attrs, params)
 
@@ -500,19 +443,12 @@ class ConvTranspose(OneFlowOpConverter):
             attrs["dilation"] = list(attrs["dilation_rate"])
             attrs.pop("dilation_rate")
 
-        if "padding_before" in attrs:
-            attrs["padding"] = attrs["padding_before"]
-            attrs.pop("padding_before")
-        if "padding_after" in attrs:
-            attrs["padding"] = attrs["padding_after"]
-            attrs.pop("padding_after")
-
         out = AttrCvt(
             op_name=dimension_picker("conv", "_transpose"),
             transforms={
                 "group": ("groups", 1),
             },
-            disables=["output_shape", "filters"],
+            disables=["output_shape", "filters", "padding_after", "padding_before"],
             custom_check=dimension_constraint_conv(),
         )([data, kernel], attr, params)
 
@@ -638,12 +574,12 @@ class Add(OneFlowOpConverter):
     """Operator converter for Add."""
 
     name = "add"
-    # TODO: 对用户的网络层命名有要求，conv层名字必须带conv，其他层不得带conv
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
-        op_name = cls.name
+        axis = int(attrs.get("axis", 0))
+
         """
         true_names和false_names参数解释：
         1. add-b存在，意味着该节点的参数为外部模型导入
@@ -657,12 +593,21 @@ class Add(OneFlowOpConverter):
 
         for i in range(2):
             T_NAMES = any(x in str(inputs[i]) for x in true_names)
-            F_NAMES =any(x in str(inputs[i]) for x in false_names)
+            F_NAMES = any(x in str(inputs[i]) for x in false_names)
             if T_NAMES and not F_NAMES:
-                axis = int(attrs.get("axis", 0))
-                if "conv" in str(inputs[i]):
-                    inputs[i] = _op.expand_dims(inputs[i], axis=axis, num_newaxis=2)
-        return get_relay_op(op_name)(*inputs)
+                add_b = inputs[i]
+            else:
+                add_a = inputs[i]
+        
+        # fix the shape
+        add_shape = infer_shape(add_a)
+        if "conv" in str(add_b):
+            add_b = _op.expand_dims(add_b, axis=axis, num_newaxis=2)
+        add_b_shape = copy.deepcopy(list(infer_shape(add_b)))
+        add_b_shape.insert(0, add_shape[0])
+        add_b = _op.reshape(add_b, tuple(add_b_shape))
+
+        return get_relay_op(cls.name)(add_a, add_b)
 
 
 class MaxPool2d(Pool):
@@ -1027,7 +972,7 @@ class OneflowGraph(object):
 
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
-                print(op_name, op_attr)
+                # print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -1064,7 +1009,7 @@ class OneflowGraph(object):
 
                 # 转换
                 op = self._convert_operator(op_name, node_inputs, op_attr)
-                print(op)
+                # print(op)
 
                 # 判断节点有多少个输出，并相应做出调整
                 if not isinstance(op, _expr.TupleWrapper):
@@ -1092,7 +1037,7 @@ class OneflowGraph(object):
                     for k, i in zip(list(node_outputs), range(len(node_outputs))):
                         self._outputs.append(k)
                         self._nodes[k] = op[i]
-                print()
+                # print()
 
         print("convert ends.")
 
@@ -1245,6 +1190,6 @@ def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
             nodes=nodes, model_dir_path=model_dir_path, 
             freeze_params=freeze_params, user_input=user_input
         )
-    print(mod)
+    # print(mod)
 
     return mod, params
