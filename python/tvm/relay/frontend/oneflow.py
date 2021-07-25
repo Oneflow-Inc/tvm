@@ -135,83 +135,6 @@ def shape_of(x, dtype="int64"):
     return _op.shape_of(x, dtype)
 
 
-def get_pad_pair(input1d, kernel1d, stride1d, mode):
-    """infer pad size"""
-    if input1d % stride1d == 0 or stride1d == 1:
-        pad = max(kernel1d - stride1d, 0)
-    else:
-        pad = max(kernel1d - (input1d % stride1d), 0)
-    pad_before = pad // 2
-    pad_after = pad - pad_before
-    if "lower" in mode:
-        return [pad_after, pad_before]
-    return [pad_before, pad_after]
-
-
-def autopad(
-    data,
-    strides,
-    kernel_shape,
-    dilations,
-    ndim,
-    pad_type="constant",
-    deconv=False,
-    mode="SAME_UPPER",
-    pad_value=0.0,
-):
-    """
-    Perform autopadding with dynamic input shapes
-    """
-    # get attributes as constants
-    strides = _op.const(np.array(strides), dtype="int64")
-    dilated_kernel_shape = _op.const(
-        np.array(
-            [(kernel - 1) * dilation + 1 for kernel, dilation in zip(kernel_shape, dilations)]
-        ),
-        dtype="int64",
-    )
-    # get input shape
-    shape = _op.strided_slice(shape_of(data, dtype="int64"), [2], [ndim])
-
-    # set up integer constants
-    zero = _op.const(0, dtype="int64")
-    one = _op.const(1, dtype="int64")
-    two = _op.const(2, dtype="int64")
-
-    # Calculate total padding
-    mod = _op.mod(shape, strides)
-
-    left = _op.maximum(dilated_kernel_shape - strides, zero)
-    right = _op.maximum(dilated_kernel_shape - mod, zero)
-
-    total_pad = _op.where(_op.equal(mod, zero), left, right)
-    if deconv:
-        total_pad = _op.const(np.array(kernel_shape), dtype="int64") - one - total_pad
-
-    # split total padding into before and after
-    pad_before = _op.floor_divide(total_pad, two)
-    pad_after = total_pad - pad_before
-    # print(str(pad_before) == str(pad_after))
-
-    # combine
-    if "lower" in mode.lower():
-        pad = _op.concatenate(
-            [_op.reshape(pad_after, [-1, 1]), _op.reshape(pad_before, [-1, 1])], axis=1
-        )
-    else:
-        pad = _op.concatenate(
-            [_op.reshape(pad_before, [-1, 1]), _op.reshape(pad_after, [-1, 1])], axis=1
-        )
-
-    # pad N and C with zeros
-    pad = _op.concatenate([_op.const(np.zeros([2, 2], dtype="int64"), dtype="int64"), pad], axis=0)
-
-    if isinstance(pad_value, (float, int)):
-        pad_value = _op.const(pad_value)
-
-    return _op.nn.pad(data, fold_constant(pad), pad_value, pad_type)
-
-
 def dimension_constraint_conv():
     def _dim_check(attrs):
         if len(attrs["kernel_size"]) in [1, 2, 3]:
@@ -360,7 +283,6 @@ class Conv(OneFlowOpConverter):
             attrs.pop("dilation_rate")
 
         pad_v = attrs.get("padding_before", [0, 0])
-        # pad_h = attrs.get("padding_after", [0, 0])
         attrs["padding"] = [pad_v[0], pad_v[1], pad_v[0], pad_v[1]]
 
         group_conv1d = False
@@ -418,30 +340,12 @@ class ConvTranspose(OneFlowOpConverter):
         if "kernel_size" not in attrs:
             attrs["kernel_size"] = kernel_shapes[0][2:]
 
-        if "padding" in attrs:
-            if attrs["padding"].lower() in ("same_upper", "same_lower"):
-                # Warning: Convolution does not yet support dynamic shapes,
-                # one will need to run dynamic_to_static on this model after import
-                data = autopad(
-                    data,
-                    attrs.get("strides", [1] * (ndim - 2)),
-                    attrs["kernel_size"],
-                    attrs.get("dilation_rate", [1] * (ndim - 2)),
-                    ndim,
-                    mode=attrs["padding"].upper(),
-                )
-            elif attrs["padding"].lower() == "vaild":
-                attrs["pads"] = [0 for i in range(ndim - 2)]
-            elif attrs["padding"].lower() == "same":
-                pass
-            else:
-                msg = 'Value {} in attribute "padding" of operator Conv is invalid.'
-                raise tvm.error.OpAttributeInvalid(msg.format(attrs["padding"]))
-            attrs.pop("padding")
-
         if "dilation_rate" in attrs:
             attrs["dilation"] = list(attrs["dilation_rate"])
             attrs.pop("dilation_rate")
+        
+        pad_v = attrs.get("padding_before", [0, 0])
+        attrs["padding"] = [pad_v[0], pad_v[1], pad_v[0], pad_v[1]]
 
         out = AttrCvt(
             op_name=dimension_picker("conv", "_transpose"),
@@ -499,6 +403,7 @@ class InstanceNorm(OneFlowOpConverter):
     """Operator converter for InstanceNorm."""
 
     @classmethod
+    # TODO
     def _impl_v1(cls, inputs, attrs, params):
         return AttrCvt(op_name="instance_norm")(inputs, attrs, params)
 
@@ -526,22 +431,22 @@ class Flatten(OneFlowOpConverter):
 
 class MatMul(OneFlowOpConverter):
     """Operator converter for MatMul."""
-    # 这个应该对应的是onnx.py中的GEMM, 仅支持2个输入
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "Gemm op take 2 inputs, {} given".format(
             len(inputs)
         )
+
         """
         true_names和false_names参数解释：
-        1. matmul-b存在，意味着该节点的参数为外部模型导入
+        1. -b存在，意味着该节点的参数为外部模型导入
            如：free_var %dense2-matmul-b: Tensor[(10, 512), float32];
            应该作为inputs[1]
         2. -in存在，意味着该节点的参数为前面的计算图计算好的结果
            应该作为inputs[0]
         """
-        true_names = ["matmul-b"]
+        true_names = ["-b"]
         false_names = ["-in"]
         for i in range(2):
             T_NAMES = any(x in str(inputs[i]) for x in true_names)
@@ -582,13 +487,13 @@ class Add(OneFlowOpConverter):
 
         """
         true_names和false_names参数解释：
-        1. add-b存在，意味着该节点的参数为外部模型导入
+        1. -b存在，意味着该节点的参数为外部模型导入
            如：free_var %conv2-bias_add-b: Tensor[(64), float32];
            应该进行expand_dims
         2. -in存在，意味着该节点的参数为前面的计算图计算好的结果
            不应该进行expand_dims
         """
-        true_names = ["bias_add-b"]
+        true_names = ["-b"]
         false_names = ["-in"]
 
         for i in range(2):
@@ -601,13 +506,101 @@ class Add(OneFlowOpConverter):
         
         # fix the shape
         add_shape = infer_shape(add_a)
-        if "conv" in str(add_b):
-            add_b = _op.expand_dims(add_b, axis=axis, num_newaxis=2)
+        if len(add_shape) > 2:
+            add_b = _op.expand_dims(add_b, axis=axis, num_newaxis=len(add_shape)-2)
         add_b_shape = copy.deepcopy(list(infer_shape(add_b)))
         add_b_shape.insert(0, add_shape[0])
         add_b = _op.reshape(add_b, tuple(add_b_shape))
 
         return get_relay_op(cls.name)(add_a, add_b)
+
+
+class Mul(OneFlowOpConverter):
+    """Operator converter for Mul"""
+
+    name = "multiply"
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
+        
+        true_names = ["-b"]
+        false_names = ["-in"]
+
+        for i in range(2):
+            T_NAMES = any(x in str(inputs[i]) for x in true_names)
+            F_NAMES = any(x in str(inputs[i]) for x in false_names)
+            if T_NAMES and not F_NAMES:
+                mul_b = inputs[i]
+            else:
+                mul_a = inputs[i]
+
+        out = get_relay_op(cls.name)(mul_a, mul_b)
+        return out
+
+
+class Sub(OneFlowOpConverter):
+    """Operator converter for Sub"""
+
+    name = "subtract"
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
+        
+        true_names = ["-b"]
+        false_names = ["-in"]
+
+        for i in range(2):
+            T_NAMES = any(x in str(inputs[i]) for x in true_names)
+            F_NAMES = any(x in str(inputs[i]) for x in false_names)
+            if T_NAMES and not F_NAMES:
+                sub_b = inputs[i]
+            else:
+                sub_a = inputs[i]
+
+        out = get_relay_op(cls.name)(sub_a, sub_b)
+        return out
+
+
+class Add_n(OneFlowOpConverter):
+    """Operator converter for Add_n."""
+
+    @classmethod
+    # TODO: remake with Add
+    def _impl_v1(cls, inputs, attrs, params):
+        assert len(inputs) > 0, "add_n take >=1 inputs, but 0 given."
+        true_names = ["-b"]
+        false_names = ["-in"]
+
+        for i in range(len(inputs)):
+            T_NAMES = any(x in str(inputs[i]) for x in true_names)
+            F_NAMES = any(x in str(inputs[i]) for x in false_names)
+            if T_NAMES and not F_NAMES:
+                sub_b = inputs[i]
+            else:
+                sub_a = inputs[i]
+        
+        res = inputs[0]
+        for each in inputs[1:]:
+            res = _op.add(res, each)
+        return res
+
+
+class Add_scalar(OneFlowOpConverter):
+    """Operator convert for Add_scalar"""
+
+    @classmethod
+    # TODO
+    def _impl_v1(cls, inputs, attrs, params):
+        assert len(inputs) == 1, "add_scalar take == 1 inputs, but {} given.".format(len(inputs))
+
+        if attrs.get("has_int_operand", False):
+            pass
+        elif attrs.get("has_float_operand", False):
+            pass
+        else:
+            raise AttributeError("please check if has_int_operand or has_float_operand in your attrs")
 
 
 class MaxPool2d(Pool):
@@ -631,7 +624,7 @@ class Reshape(OneFlowOpConverter):
 
         return out
 
-    
+
 class Softmax(OneFlowOpConverter):
     """Operator converter for Softmax."""
 
@@ -694,6 +687,10 @@ def get_convert_map():
     return {
         # defs/math
         "bias_add": Add.get_converter(),
+        "scalar_add": Add_scalar.get_converter(),
+        "broadcast_add": Add.get_converter(),
+        "broadcast_mul": Mul.get_converter(),
+        "broadcast_sub": Sub.get_converter(),
         "log": Renamer("log"),
         "acos": Renamer("acos"),
         "acosh": Renamer("acosh"),
@@ -712,6 +709,8 @@ def get_convert_map():
         "floor": Renamer("floor"),
         "ceil": Renamer("ceil"),
         "round": Renamer("round"),
+        "add_n": Add_n.get_converter(),
+        "rsqrt": Renamer("rsqrt"),
         # defs/activation
         "sigmoid": Renamer("sigmoid"),
         "relu": Renamer("relu"),
@@ -811,8 +810,8 @@ class OneflowGraph(object):
         self._num_input = 0
         self._num_param = 0
         self._input_names = []
-        self._input_name_2_path = {}
         self._model_array = {}
+        self._input_path_2_name = {}
         self._outputs = []
         self._shape = shape
         self._dtype = dtype
@@ -826,19 +825,25 @@ class OneflowGraph(object):
             layer_p['path'] = model[layer].file_path # 模型参数所在路径
             layer_p['params'] = model[layer].numpy() # 模型各层ndarray
             self._model_array[str(layer)] = layer_p
-
+            
+        """
+        node_outputs的名字不会直接出现在node.user_conf.input里面
+        所以在构建计算图的时候会导致层与层之间的联系被斩断
+        修补步骤：
+        1. 找到此时node_outputs对应的路径
+        2. 将该路径与node.user_conf.input里面的对应起来，也就是说，需要在__init__的时候创建一个
+            所有node.user_conf.input与其路径的dict
+        3. 在output的new_var的时候将node_outputs的名字换成找到的node_input的名字
+        """
         for node_name in nodes:
             node = nodes[node_name]
             if is_user_op(node):
                 for input_name in node.user_conf.input:
                     node_init_name = node_name + '-' + input_name
                     node_input_path = getattr(node.user_conf.input[input_name], 's')
-                    if len(node_input_path) == 1:
-                        node_input_path = os.path.join(model_dir_path, node_input_path[0])
-                    else:
-                        pass
-
-                    self._input_name_2_path[node_init_name] = node_input_path
+                    for i in range(len(node_input_path)):
+                        node_input_path = os.path.join(model_dir_path, node_input_path[i])
+                        self._input_path_2_name[node_input_path] = node_init_name
 
                     for node_input_name in self._model_array:
                         node_p = self._model_array[node_input_name]
@@ -852,24 +857,13 @@ class OneflowGraph(object):
                                 dtype=str(node_array.dtype)
                             )
 
-        """
-        node_outputs的名字不会直接出现在node.user_conf.input里面
-        所以在构建计算图的时候会导致层与层之间的联系被斩断
-        修补步骤：
-        1. 找到此时node_outputs对应的路径
-        2. 将该路径与node.user_conf.input里面的对应起来，也就是说，需要在__init__的时候创建一个
-            所有node.user_conf.input与其路径的dict
-        3. dict反转，找到与node_outputs同一路径的node_input(下句)
-        4. 在output的new_var的时候将node_outputs的名字换成找到的node_input的名字
-        """
-        self._input_path_2_name = {v: k for k, v in self._input_name_2_path.items()}
-
         self._output_path_2_name = {}
         for node_name in nodes:
             node = nodes[node_name]
             if is_output_op(node):
                 output_path = os.path.join(model_dir_path, getattr(node.return_conf, "in"))
                 self._output_path_2_name[output_path] = node_name
+
 
     def _parse_input(self, node, model_dir_path):
         for input_name in node.user_conf.input:
@@ -962,7 +956,7 @@ class OneflowGraph(object):
             raise tvm.error.OpNotImplemented(msg)
 
         # step 3: convert op
-        print("converting: ----------")
+        # print("converting: ----------")
         for node_name in nodes:
             node = nodes[node_name]
             if is_user_op(node):
@@ -972,7 +966,7 @@ class OneflowGraph(object):
 
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
-                # print(op_name, op_attr)
+                print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -1037,9 +1031,9 @@ class OneflowGraph(object):
                     for k, i in zip(list(node_outputs), range(len(node_outputs))):
                         self._outputs.append(k)
                         self._nodes[k] = op[i]
-                # print()
+                print()
 
-        print("convert ends.")
+        # print("convert ends.")
 
         # step 4: get the outputs
         outputs = []
