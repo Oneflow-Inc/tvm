@@ -153,6 +153,70 @@ def dimension_constraint_pool():
     return _dim_check, "Only 1d, 2d and 3d kernel supported."
 
 
+def autopad(
+    data,
+    strides,
+    kernel_shape,
+    dilations,
+    ndim,
+    pad_type="constant",
+    deconv=False,
+    mode="SAME_UPPER",
+    pad_value=0.0,
+):
+    """
+    Perform autopadding with dynamic input shapes
+    """
+    mode = mode.upper()
+    # get attributes as constants
+    strides = _op.const(np.array(strides), dtype="int64")
+    dilated_kernel_shape = _op.const(
+        np.array(
+            [(kernel - 1) * dilation + 1 for kernel, dilation in zip(kernel_shape, dilations)]
+        ),
+        dtype="int64",
+    )
+    # get input shape
+    shape = _op.strided_slice(shape_of(data, dtype="int64"), [2], [ndim])
+
+    # set up integer constants
+    zero = _op.const(0, dtype="int64")
+    one = _op.const(1, dtype="int64")
+    two = _op.const(2, dtype="int64")
+
+    # Calculate total padding
+    mod = _op.mod(shape, strides)
+
+    left = _op.maximum(dilated_kernel_shape - strides, zero)
+    right = _op.maximum(dilated_kernel_shape - mod, zero)
+
+    total_pad = _op.where(_op.equal(mod, zero), left, right)
+    if deconv:
+        total_pad = _op.const(np.array(kernel_shape), dtype="int64") - one - total_pad
+
+    # split total padding into before and after
+    pad_before = _op.floor_divide(total_pad, two)
+    pad_after = total_pad - pad_before
+
+    # combine
+    if "LOWER" in mode:
+        pad = _op.concatenate(
+            [_op.reshape(pad_after, [-1, 1]), _op.reshape(pad_before, [-1, 1])], axis=1
+        )
+    else:
+        pad = _op.concatenate(
+            [_op.reshape(pad_before, [-1, 1]), _op.reshape(pad_after, [-1, 1])], axis=1
+        )
+
+    # pad N and C with zeros
+    pad = _op.concatenate([_op.const(np.zeros([2, 2], dtype="int64"), dtype="int64"), pad], axis=0)
+
+    if isinstance(pad_value, (float, int)):
+        pad_value = _op.const(pad_value)
+
+    return _op.nn.pad(data, fold_constant(pad), pad_value, pad_type)
+
+
 class OneFlowOpConverter:
     """A helper class for holding oneflow op converters."""
 
@@ -184,7 +248,6 @@ class Pool(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         data = inputs[0]
         input_shape = infer_shape(data)
-        # print("pool inputs shape: {}".format(input_shape))
         input_dtype = infer_type(data).checked_type.dtype
         ndim = len(input_shape)
 
@@ -201,19 +264,36 @@ class Pool(OneFlowOpConverter):
             if attrs["padding"].lower() in ("same_upper", "same_lower"):
                 pad_v = attrs.get("padding_before", [0, 0])
                 pad_h = attrs.get("padding_after", [0, 0])
+                if "avg_pool" not in cls.name:
+                    if "int" in input_dtype:
+                        pad_val = np.iinfo(np.dtype(input_dtype)).min
+                    else:
+                        pad_val = np.finfo(np.dtype(input_dtype)).min
+                    data = autopad(
+                        data,
+                        attrs.get("strides", [1] * (ndim - 2)),
+                        attrs["pool_size"],
+                        [1] * ndim,
+                        ndim,
+                        pad_value=pad_val,
+                        mode=attrs["padding"],
+                    )
                 attrs["padding"] = [pad_v[0], pad_v[1], pad_h[0], pad_h[1]]
             elif attrs["padding"].lower() == "valid":
                 attrs["padding"] = tuple([0 for _ in range(ndim - 2)])
             else:
                 msg = 'Value {} in attribute "padding" of operator {} is invalid.'
                 raise tvm.error.OpAttributeInvalid(msg.format(attrs["padding"], cls.name))
+        
+        if "avg_pool" in cls.name:
+            attrs["count_include_pad"] = False
 
         out = AttrCvt(
             op_name=cls.name,
             transforms={
                 "dilations": ("dilation", 1),
             },
-            ignores=["storage_order", "data_format", "padding_before", "padding_after"],
+            ignores=["padding_before", "padding_after"],
             custom_check=dimension_constraint_pool(),
         )([data], attrs, params)
 
@@ -263,16 +343,19 @@ class Conv(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        # Use shape of input to determine convolution type.
+        # kernel必然是外部导入参数，不会存在"out_0"这中中间变量标识
+        # 但是conv1-in这种初始输入不带"out_0"标识，需要用Input_0判断
         for i in inputs:
-            if "-in" not in str(i):
+            if "Input_0" in str(i):
+                data = i
+            elif "weight" in str(i) and "out_0" not in str(i) and "-in" not in str(i):
                 kernel = i
             else:
                 data = i
         input_shape = infer_shape(data)
         ndim = len(input_shape)
-        # print(input_shape, ndim)
 
+        # Use shape of input to determine convolution type.
         kernel_type = infer_type(kernel)
         kernel_shapes = [get_const_tuple(kernel_type.checked_type.shape)]
 
@@ -322,7 +405,9 @@ class ConvTranspose(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         # get number of channels
         for i in inputs:
-            if "-in" not in str(i):
+            if "Input_0" in str(i):
+                data = i
+            elif "weight" in str(i) and "out_0" not in str(i):
                 kernel = i
             else:
                 data = i
@@ -372,7 +457,7 @@ class BatchNorm(OneFlowOpConverter):
         # sort the inputs
         sorted_inputs = copy.deepcopy(inputs)
         for i in range(len(inputs)):
-            IN_NAMES = '-in' in str(inputs[i])
+            IN_NAMES = any(x in str(inputs[i]) for x in ["-in", "out_0"])
             if IN_NAMES:
                 sorted_inputs[0] = inputs[i]
             elif 'gamma' in str(inputs[i]) and not IN_NAMES:
@@ -447,7 +532,7 @@ class MatMul(OneFlowOpConverter):
            应该作为inputs[0]
         """
         true_names = ["-b"]
-        false_names = ["-in"]
+        false_names = ["-in", "out_0"]
         for i in range(2):
             T_NAMES = any(x in str(inputs[i]) for x in true_names)
             F_NAMES = any(x in str(inputs[i]) for x in false_names)
@@ -494,7 +579,7 @@ class Add(OneFlowOpConverter):
            不应该进行expand_dims
         """
         true_names = ["-b"]
-        false_names = ["-in"]
+        false_names = ["-in", "out_0"]
 
         for i in range(2):
             T_NAMES = any(x in str(inputs[i]) for x in true_names)
@@ -515,71 +600,43 @@ class Add(OneFlowOpConverter):
         return get_relay_op(cls.name)(add_a, add_b)
 
 
-class Mul(OneFlowOpConverter):
-    """Operator converter for Mul"""
+class BroadcastMath(OneFlowOpConverter):
+    """Operator converter for broadcast math ops"""
+
+    name = ""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
+
+        out = get_relay_op(cls.name)(*inputs)
+        return out
+
+
+class Mul_broadcast(BroadcastMath):
+    """Operator converter for Mul broadcast"""
 
     name = "multiply"
 
-    @classmethod
-    def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
-        
-        true_names = ["-b"]
-        false_names = ["-in"]
 
-        for i in range(2):
-            T_NAMES = any(x in str(inputs[i]) for x in true_names)
-            F_NAMES = any(x in str(inputs[i]) for x in false_names)
-            if T_NAMES and not F_NAMES:
-                mul_b = inputs[i]
-            else:
-                mul_a = inputs[i]
+class Add_broadcast(BroadcastMath):
+    """Operator converter for Add broadcast"""
 
-        out = get_relay_op(cls.name)(mul_a, mul_b)
-        return out
+    name = "add"
 
 
-class Sub(OneFlowOpConverter):
-    """Operator converter for Sub"""
+class Sub_broadcast(BroadcastMath):
+    """Operator converter for Sub broadcast"""
 
     name = "subtract"
-
-    @classmethod
-    def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
-        
-        true_names = ["-b"]
-        false_names = ["-in"]
-
-        for i in range(2):
-            T_NAMES = any(x in str(inputs[i]) for x in true_names)
-            F_NAMES = any(x in str(inputs[i]) for x in false_names)
-            if T_NAMES and not F_NAMES:
-                sub_b = inputs[i]
-            else:
-                sub_a = inputs[i]
-
-        out = get_relay_op(cls.name)(sub_a, sub_b)
-        return out
 
 
 class Add_n(OneFlowOpConverter):
     """Operator converter for Add_n."""
 
     @classmethod
-    # TODO: remake with Add
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) > 0, "add_n take >=1 inputs, but 0 given."
-        true_names = ["-b"]
-        false_names = ["-in"]
-
-        for i in range(len(inputs)):
-            T_NAMES = any(x in str(inputs[i]) for x in true_names)
-            F_NAMES = any(x in str(inputs[i]) for x in false_names)
-            if T_NAMES and not F_NAMES:
-                sub_b = inputs[i]
-            else:
-                sub_a = inputs[i]
         
         res = inputs[0]
         for each in inputs[1:]:
@@ -591,14 +648,13 @@ class Add_scalar(OneFlowOpConverter):
     """Operator convert for Add_scalar"""
 
     @classmethod
-    # TODO
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 1, "add_scalar take == 1 inputs, but {} given.".format(len(inputs))
 
         if attrs.get("has_int_operand", False):
-            pass
+            return inputs[0] + _expr.const(attrs["int_operand"])
         elif attrs.get("has_float_operand", False):
-            pass
+            return inputs[0] + _expr.const(attrs["float_operand"])
         else:
             raise AttributeError("please check if has_int_operand or has_float_operand in your attrs")
 
@@ -682,15 +738,86 @@ class PReLU(OneFlowOpConverter):
         return out
 
 
+class Concat(OneFlowOpConverter):
+    """Operator converter for Concat."""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        return AttrCvt(op_name="concatenate")((inputs,), attrs)
+
+
+class Clip(OneFlowOpConverter):
+    """Operator converter for Clip."""
+
+    @staticmethod
+    def convert_attributes(inputs, attrs, params):
+        convert = AttrCvt("clip", transforms={"min": "a_min", "max": "a_max"})
+        return convert(inputs, attrs, params)
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        if "min" not in attrs:
+            attrs["min"] = -np.inf
+        if "max" not in attrs:
+            attrs["max"] = np.inf
+        return Clip.convert_attributes(inputs, attrs, params)
+
+
+class Slice(OneFlowOpConverter):
+    """Operator converter for Slice."""
+
+    @classmethod
+    def _common(cls, starts, ends, axes):
+        new_axes = []
+        new_starts = []
+        new_ends = []
+        pop_index = 0
+        for i in range(max(axes) + 1):
+            if i in axes:
+                new_axes.append(i)
+                new_starts.append(starts[pop_index])
+                new_ends.append(ends[pop_index])
+                pop_index += 1
+            else:
+                new_axes.append(i)
+                new_starts.append(0)
+                new_ends.append(np.iinfo(np.int32).max)
+        return new_starts, new_ends, new_axes
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        if isinstance(attrs["starts"], int):
+            attrs["starts"] = (attrs["starts"],)
+            attrs["ends"] = (attrs["ends"],)
+
+        try:
+            # Update the starts and ends according to axes if required.
+            if isinstance(attrs["axes"], int):
+                attrs["axes"] = (attrs["axes"],)
+            if (max(attrs["axes"]) + 1) != len(attrs["axes"]):
+                new_starts, new_ends, new_axes = cls._common(
+                    attrs["starts"], attrs["ends"], attrs["axes"]
+                )
+                attrs["axes"] = new_axes
+                attrs["starts"] = new_starts
+                attrs["ends"] = new_ends
+        except KeyError:
+            pass
+        begin = list(attrs["starts"])
+        end = list(attrs["ends"])
+
+        return _op.strided_slice(inputs[0], begin=begin, end=end)
+
+
 def get_convert_map():
     # TODO: 记录实现的oneflow2relay op
     return {
         # defs/math
         "bias_add": Add.get_converter(),
         "scalar_add": Add_scalar.get_converter(),
-        "broadcast_add": Add.get_converter(),
-        "broadcast_mul": Mul.get_converter(),
-        "broadcast_sub": Sub.get_converter(),
+        "broadcast_add": Add_broadcast.get_converter(),
+        "broadcast_mul": Mul_broadcast.get_converter(),
+        "broadcast_sub": Sub_broadcast.get_converter(),
         "log": Renamer("log"),
         "acos": Renamer("acos"),
         "acosh": Renamer("acosh"),
@@ -723,6 +850,9 @@ def get_convert_map():
         "normalization": BatchNorm.get_converter(),
         # defs/tensor
         "matmul": MatMul.get_converter(),
+        "concat": Concat.get_converter(),
+        "clip_by_scalar": Clip.get_converter(),
+        "slice": Slice.get_converter(),
         # defs/others
         "reshape": Reshape.get_converter(),
     }
@@ -805,13 +935,13 @@ class OneflowGraph(object):
     def __init__(self, shape, dtype, nodes, model_dir_path) -> None:
         self._nodes = {}
         self._params = {}
-        self._renames = {}
         self._inputs = {}
         self._num_input = 0
         self._num_param = 0
         self._input_names = []
         self._model_array = {}
         self._input_path_2_name = {}
+        self._output_path_2_name = {}
         self._outputs = []
         self._shape = shape
         self._dtype = dtype
@@ -840,51 +970,60 @@ class OneflowGraph(object):
             if is_user_op(node):
                 for input_name in node.user_conf.input:
                     node_init_name = node_name + '-' + input_name
-                    node_input_path = getattr(node.user_conf.input[input_name], 's')
-                    for i in range(len(node_input_path)):
-                        node_input_path = os.path.join(model_dir_path, node_input_path[i])
-                        self._input_path_2_name[node_input_path] = node_init_name
+                    node_input_paths = getattr(node.user_conf.input[input_name], 's')
+                    for i in range(len(node_input_paths)):
+                        node_input_path = os.path.join(model_dir_path, node_input_paths[i])
+                        node_name_ = node_init_name + node_input_path
+                        if node_input_path not in self._input_path_2_name:
+                            self._input_path_2_name[node_input_path] = node_name_
+                        else:
+                            names = list(node_name_)
+                            names.append(self._input_path_2_name[node_input_path])
+                            self._input_path_2_name[node_input_path] = names
+                        for param_name in self._model_array:
+                            node_p = self._model_array[param_name]
+                            if node_input_path == node_p['path']:
+                                node_array = node_p['params']
+                                self._params[node_name_] = node_array
+                                self._nodes[node_name_] = new_var(
+                                    node_name_, 
+                                    shape=node_array.shape,
+                                    dtype=str(node_array.dtype)
+                                )
 
-                    for node_input_name in self._model_array:
-                        node_p = self._model_array[node_input_name]
-
-                        if node_input_path == node_p['path']:
-                            node_array = node_p['params']
-                            self._params[node_init_name] = node_array
-                            self._nodes[node_init_name] = new_var(
-                                node_init_name, 
-                                shape=node_array.shape,
-                                dtype=str(node_array.dtype)
-                            )
-
-        self._output_path_2_name = {}
         for node_name in nodes:
             node = nodes[node_name]
             if is_output_op(node):
                 output_path = os.path.join(model_dir_path, getattr(node.return_conf, "in"))
-                self._output_path_2_name[output_path] = node_name
+                self._output_path_2_name[output_path] = node_name + output_path
 
 
     def _parse_input(self, node, model_dir_path):
         for input_name in node.user_conf.input:
             node_input_name = node.name + '-' + input_name
-
-            node_input_path = getattr(node.user_conf.input[input_name], 's')
-            if len(node_input_path) == 1:
-                node_input_path = os.path.join(model_dir_path, node_input_path[0])
-            else:
-                pass
-
-            node_input_shape = self._shape[node_input_path]
-            node_input_dtype = self._dtype[node_input_path]
-
-            if node_input_name != "":
-                if node_input_name not in self._nodes:
-                    self._nodes[node_input_name] = new_var(
-                        node_input_name,
-                        shape=node_input_shape,
-                        dtype=node_input_dtype
-                    )
+            node_input_paths = getattr(node.user_conf.input[input_name], 's')
+            for i in range(len(node_input_paths)):
+                node_input_path = os.path.join(model_dir_path, node_input_paths[i])
+                node_input_shape = self._shape[node_input_path]
+                node_input_dtype = self._dtype[node_input_path]
+                node_name = node_input_name + node_input_path
+                # if node_input_path not in self._nodes
+                if node_name not in self._nodes:
+                    if "Input_0" in node_name or node_input_path not in self._input_path_2_name:
+                        self._nodes[node_name] = new_var(
+                            node_name,
+                            shape=node_input_shape,
+                            dtype=node_input_dtype
+                        )
+                    # 查找self._nodes中同路径的node，并copy
+                    else:
+                        names = self._input_path_2_name[node_input_path]
+                        for i in names:
+                            if i in self._nodes:
+                                node_replace = i
+                                break
+                        op_replace = copy.deepcopy(self._nodes[node_replace])
+                        self._nodes[node_name] = op_replace
 
 
     def from_oneflow(self, nodes, model_dir_path, freeze_params=True, user_input=None):
@@ -905,7 +1044,7 @@ class OneflowGraph(object):
             {
                 node1_name: 
                 {
-                    'name': node1_name,    # str, like "conv1-in"
+                    'name': node1_name,    # str, like "conv1-in./model_path/Input_0"
                     'shape': node1_shape,  # tuple
                     'dtype': node1_dtype   # str, like "float16"
                 }
@@ -956,7 +1095,6 @@ class OneflowGraph(object):
             raise tvm.error.OpNotImplemented(msg)
 
         # step 3: convert op
-        # print("converting: ----------")
         for node_name in nodes:
             node = nodes[node_name]
             if is_user_op(node):
@@ -966,7 +1104,6 @@ class OneflowGraph(object):
 
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
-                print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -976,34 +1113,31 @@ class OneflowGraph(object):
                 node_inputs = oneflow_input()
                 for input_name in node.user_conf.input:
                     node_input_name = node_name + '-' + input_name
-                    if node_input_name != "":
-                        o = self._renames.get(node_input_name, node_input_name)
-                        node_inputs[node_input_name] = self._nodes[o]
-                    else:
-                        node_inputs[node_input_name] = None
+                    node_input_paths = getattr(node.user_conf.input[input_name], 's')
+                    for i in range(len(node_input_paths)):
+                        node_input_path = os.path.join(model_dir_path, node_input_paths[i])
+                        node_input_shape = self._shape[node_input_path]
+                        node_input_dtype = self._dtype[node_input_path]
+                        node_name_ = node_input_name + node_input_path
+                        node_inputs[node_name_] = self._nodes[node_name_]
 
                 node_outputs = []
                 for output_name in node.user_conf.output:
-                    node_output_name = str(node_name) + '-' + str(output_name)
-
-                    node_output_path = getattr(node.user_conf.output[output_name], 's')
-                    if len(node_output_path) == 1:
-                        node_output_path = os.path.join(model_dir_path, node_output_path[0])
-                    else:
-                        pass
-                    
-                    if node_output_path in self._input_path_2_name:
-                        node_outputs.append(self._input_path_2_name[node_output_path])
-                    elif node_output_path in self._output_path_2_name:
-                        node_outputs.append(self._output_path_2_name[node_output_path])
-                    else:
-                        warnings.warn("{} is not in known path".format(node_output_path))
+                    node_output_name = node_name + '-' + output_name
+                    node_output_paths = getattr(node.user_conf.output[output_name], 's')
+                    for i in range(len(node_output_paths)):
+                        node_output_path = os.path.join(model_dir_path, node_output_paths[i])
+                        if node_output_path in self._input_path_2_name:
+                            node_outputs.append(self._input_path_2_name[node_output_path])
+                        elif node_output_path in self._output_path_2_name:
+                            node_outputs.append(self._output_path_2_name[node_output_path])
+                        else:
+                            warnings.warn("{} is not in known path".format(node_output_path))
 
                 node_outputs = fix_outputs(op_name, node_outputs)
 
                 # 转换
                 op = self._convert_operator(op_name, node_inputs, op_attr)
-                # print(op)
 
                 # 判断节点有多少个输出，并相应做出调整
                 if not isinstance(op, _expr.TupleWrapper):
@@ -1020,29 +1154,33 @@ class OneflowGraph(object):
                 else:
                     op = _expr.TupleWrapper(fold_constant(op.astuple()), len(op))
 
-                # TODO: 关于可选输出与输出的清洗，oneflow可能暂时不需要
-                if outputs_num > 1:
-                    pass
-
                 if outputs_num == 1:
-                    self._nodes[node_outputs[0]] = op
-                    self._outputs.append(node_outputs[0])
+                    if isinstance(node_outputs[0], list):
+                        for i in node_outputs[0]:
+                            self._nodes[i] = op
+                            self._outputs.append(i)
+                    else:
+                        self._nodes[node_outputs[0]] = op
+                        self._outputs.append(node_outputs[0])
                 else:
-                    for k, i in zip(list(node_outputs), range(len(node_outputs))):
-                        self._outputs.append(k)
-                        self._nodes[k] = op[i]
-                print()
-
-        # print("convert ends.")
+                    for i in range(len(node_outputs)):
+                        if isinstance(node_outputs[i], list):
+                            for k in node_outputs[i]:
+                                self._nodes[k] = op
+                                self._outputs.append(k)
+                        else:
+                            self._outputs.append(node_outputs[i])
+                            self._nodes[node_outputs[i]] = op[i]
 
         # step 4: get the outputs
         outputs = []
         for node_name in nodes:
             node = nodes[node_name]
             if is_output_op(node):
-                if node_name in self._nodes:
-                    outputs.append(self._nodes[node_name])
-
+                node_path = os.path.join(model_dir_path, getattr(node.return_conf, "in"))
+                node_name_ = node_name + node_path
+                if node_name_ in self._nodes:
+                    outputs.append(self._nodes[node_name_])
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
 
         # step 5: get the relay IR
@@ -1054,12 +1192,11 @@ class OneflowGraph(object):
         # step 6: make sure the '-in' is the first in self._inputs
         # free_vars都应该存储到self._inputs里头
         for free_var in free_vars:
-            if free_var not in self._inputs:
-                self._inputs[free_var] = self._nodes[free_var]
+            self._inputs[free_var] = self._nodes[free_var]
 
         input_names = list(self._inputs.keys())
         for i in range(len(input_names)):
-            if i != 0 and '-in' in input_names[i]:
+            if i != 0 and 'Input_0' in input_names[i]:
                 str_buffer = copy.deepcopy(input_names[i])
                 del input_names[i]
                 input_names.insert(0, str_buffer)
@@ -1122,7 +1259,7 @@ def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
         {
             node1_name: 
             {
-                'name': node1_name,    # str, like "conv1-in"
+                'name': node1_name,    # str, like "conv1-in./model_path/Input_0"
                 'shape': node1_shape,  # tuple
                 'dtype': node1_dtype   # str, like "float16"
             }
