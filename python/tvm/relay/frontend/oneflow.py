@@ -46,43 +46,44 @@ _identity_list = []
 
 
 def is_input_op(node):
-    # 用来判断该节点的op是否为input_conf
+    # Determine if the the node is the input of graph
     return node.WhichOneof("op_type") == "input_conf"
 
 
 def is_user_op(node):
-    # 用来判断该节点的op是否为user_conf
+    # Determine if the the node is the intermediate variables of graph
     return node.WhichOneof("op_type") == "user_conf"
 
 
 def is_output_op(node):
-    # 用来判断该节点的op是否为return_conf
+    # Determine if the the node is the output of graph
     return node.WhichOneof("op_type") == "return_conf"
 
 
 def is_param_op(node):
-    # 用来判断该节点的op是否为variable_conf
+    # Determine if the the node is the intermediate variables of model(saved)
     return node.WhichOneof("op_type") == "variable_conf"
 
 
 def get_node_info(node):
     """
-    获取node基本信息: shape、data_type
+    Get basic information about nodes: shape、data_type
     """
-    # 获取形状，转为list->tuple
+    # list->tuple
     shape = tuple(node.input_conf.blob_conf.shape.dim)
-    # 获取数据类型
+    # get data type
     dtype = node.input_conf.blob_conf.data_type
     if dtype in list(FLOW_2_NP_DTYPE.keys()):
         data_type = FLOW_2_NP_DTYPE[dtype]
     else:
         raise IndexError('Please check the data type of your node: %s' % node.name)
+
     return shape, data_type
 
 
 def parse_attr(attr):
-    # 解析node_attr
-    # TODO: 可能数据类型有遗漏
+    # Parse node_attr
+    # TODO(hujiakui): may have missed
     attrs = {}
     for a in attr:
         attr_str = str(attr[a])
@@ -115,6 +116,7 @@ def parse_attr(attr):
                 attrs[a] = attr[a].at_int32
             elif attr_str_ == "at_int64":
                 attrs[a] = attr[a].at_int64
+
     return attrs
 
 
@@ -122,8 +124,9 @@ def fix_outputs(op_name, outputs):
     if op_name.lower() == "Dropout":
         if len(outputs) == 1:
             return outputs
-        # TODO(zhreshold): support dropout mask?
+        # TODO(zhreshold): support dropout mask? `onnx.py`
         outputs = outputs[:-1]
+
     return outputs
 
 
@@ -132,6 +135,7 @@ def shape_of(x, dtype="int64"):
     if not _ty.is_dynamic(ttype):
         shape = list(ttype.shape)
         return _expr.const(shape, dtype)
+
     return _op.shape_of(x, dtype)
 
 
@@ -168,6 +172,7 @@ def autopad(
     Perform autopadding with dynamic input shapes
     """
     mode = mode.upper()
+
     # get attributes as constants
     strides = _op.const(np.array(strides), dtype="int64")
     dilated_kernel_shape = _op.const(
@@ -176,6 +181,7 @@ def autopad(
         ),
         dtype="int64",
     )
+
     # get input shape
     shape = _op.strided_slice(shape_of(data, dtype="int64"), [2], [ndim])
 
@@ -222,14 +228,14 @@ class OneFlowOpConverter:
 
     @classmethod
     def get_converter(cls):
-        """Get converter matches given opset.
+        """
+        Get converter matches given opset.
         Parameters
         ----------
         
         Returns
         -------
-        converter, which should be `_impl_vx`. Number x is the biggest
-            number smaller than or equal to opset belongs to all support versions.
+        converter, which should be `_impl_vx`.
         """
         version = 1
         if hasattr(cls, "_impl_v{}".format(version)):
@@ -338,13 +344,13 @@ class GlobalMaxPool(OneFlowOpConverter):
 
 
 class Conv(OneFlowOpConverter):
-    """Operator converter for Conv."""
+    """A helper class for conv op converters."""
     name = ""
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        # kernel必然是外部导入参数，不会存在"out_0"这中中间变量标识
-        # 但是conv1-in这种初始输入不带"out_0"标识，需要用Input_0判断
+        # The kernel is imported from model_dir_path, without the "out_0" logo, etc.
+        # The data is obtained through the graph, its op contains "Input_0"
         for i in inputs:
             if "Input_0" in str(i):
                 data = i
@@ -403,7 +409,6 @@ class ConvTranspose(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        # get number of channels
         for i in inputs:
             if "Input_0" in str(i):
                 data = i
@@ -411,6 +416,8 @@ class ConvTranspose(OneFlowOpConverter):
                 kernel = i
             else:
                 data = i
+
+        # get number of channels
         out_type = infer_type(kernel)
         out_shapes = [get_const_tuple(out_type.checked_type.shape)]
         attrs["channels"] = attrs.get("filters", 1)
@@ -446,6 +453,7 @@ class ConvTranspose(OneFlowOpConverter):
 
 class Conv2d(Conv):
     """Operator converter for Conv2d."""
+
     name = "conv2d"
 
 
@@ -456,18 +464,18 @@ class BatchNorm(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         # sort the inputs
         sorted_inputs = copy.deepcopy(inputs)
-        for i in range(len(inputs)):
-            IN_NAMES = any(x in str(inputs[i]) for x in ["-in", "out_0"])
+        for i in inputs:
+            IN_NAMES = "Input_0" in str(i)
             if IN_NAMES:
-                sorted_inputs[0] = inputs[i]
-            elif 'gamma' in str(inputs[i]) and not IN_NAMES:
-                sorted_inputs[1] = inputs[i]
-            elif 'beta' in str(inputs[i]) and not IN_NAMES:
-                sorted_inputs[2] = inputs[i]
-            elif 'mean' in str(inputs[i]) and not IN_NAMES:
-                sorted_inputs[3] = inputs[i]
-            elif 'variance' in str(inputs[i]) and not IN_NAMES:
-                sorted_inputs[4] = inputs[i]
+                sorted_inputs[0] = i
+            elif 'gamma' in str(i) and not IN_NAMES:
+                sorted_inputs[1] = i
+            elif 'beta' in str(i) and not IN_NAMES:
+                sorted_inputs[2] = i
+            elif 'mean' in str(i) and not IN_NAMES:
+                sorted_inputs[3] = i
+            elif 'variance' in str(i) and not IN_NAMES:
+                sorted_inputs[4] = i
 
         axis = 3
         if "data_format" in attrs:
@@ -488,7 +496,7 @@ class InstanceNorm(OneFlowOpConverter):
     """Operator converter for InstanceNorm."""
 
     @classmethod
-    # TODO
+    # TODO(hujiakui): sort the inputs
     def _impl_v1(cls, inputs, attrs, params):
         return AttrCvt(op_name="instance_norm")(inputs, attrs, params)
 
@@ -522,15 +530,7 @@ class MatMul(OneFlowOpConverter):
         assert len(inputs) == 2, "Gemm op take 2 inputs, {} given".format(
             len(inputs)
         )
-
-        """
-        true_names和false_names参数解释：
-        1. -b存在，意味着该节点的参数为外部模型导入
-           如：free_var %dense2-matmul-b: Tensor[(10, 512), float32];
-           应该作为inputs[1]
-        2. -in存在，意味着该节点的参数为前面的计算图计算好的结果
-           应该作为inputs[0]
-        """
+        # Similar to 'class Conv'
         true_names = ["-b"]
         false_names = ["-in", "out_0"]
         for i in range(2):
@@ -542,10 +542,12 @@ class MatMul(OneFlowOpConverter):
                 matmul_a = inputs[i]
 
         dtype = infer_type(matmul_a).checked_type.dtype
+
         # Y = alpha * A * B
         alpha = float(attrs.get("alpha", 1.0))
         transA = bool(attrs.get("transpose_a", False))
         transB = bool(attrs.get("transpose_b", False))
+
         # get number of channels
         channels = infer_channels(matmul_b, not transB)
         if transA:
@@ -555,9 +557,8 @@ class MatMul(OneFlowOpConverter):
         matmul_a = _op.nn.batch_flatten(matmul_a)
         if alpha != 1.0:
             matmul_a *= _expr.const(alpha, dtype=dtype)
-        out = _op.nn.dense(matmul_a, matmul_b, units=channels)
 
-        return out
+        return _op.nn.dense(matmul_a, matmul_b, units=channels)
 
 
 class Add(OneFlowOpConverter):
@@ -570,14 +571,6 @@ class Add(OneFlowOpConverter):
         assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
         axis = int(attrs.get("axis", 0))
 
-        """
-        true_names和false_names参数解释：
-        1. -b存在，意味着该节点的参数为外部模型导入
-           如：free_var %conv2-bias_add-b: Tensor[(64), float32];
-           应该进行expand_dims
-        2. -in存在，意味着该节点的参数为前面的计算图计算好的结果
-           不应该进行expand_dims
-        """
         true_names = ["-b"]
         false_names = ["-in", "out_0"]
 
@@ -608,9 +601,15 @@ class BroadcastMath(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
+        beta_names = ["-b", "-beta", "-gamma", "_mean", "_variance"]
+        for i in inputs:
+            T_NAMES = any([x in str(i) for x in beta_names])
+            if T_NAMES and "Input_0" not in str(i):
+                input_b = i
+            else:
+                input_a = i
 
-        out = get_relay_op(cls.name)(*inputs)
-        return out
+        return get_relay_op(cls.name)(input_a, input_b)
 
 
 class Mul_broadcast(BroadcastMath):
@@ -676,9 +675,7 @@ class Reshape(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        out = _op.reshape(inputs[0], attrs["shape"])
-
-        return out
+        return _op.reshape(inputs[0], attrs["shape"])
 
 
 class Softmax(OneFlowOpConverter):
@@ -728,7 +725,7 @@ class PReLU(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        # TODO: need to know which one is the input
+        # TODO(hujiakui): sort the inputs
         assert len(inputs) == 2, "PReLU need 2 inputs, but {} given".format(len(inputs))
         input_shape = shape_of(inputs[0])
         alpha = _op.broadcast_to_like(inputs[1], inputs[0])
@@ -743,74 +740,47 @@ class Concat(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
+        # TODO: 可能有顺序问题
+        attrs.pop("max_dim_size")
         return AttrCvt(op_name="concatenate")((inputs,), attrs)
 
 
 class Clip(OneFlowOpConverter):
     """Operator converter for Clip."""
 
-    @staticmethod
-    def convert_attributes(inputs, attrs, params):
-        convert = AttrCvt("clip", transforms={"min": "a_min", "max": "a_max"})
-        return convert(inputs, attrs, params)
-
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        if "min" not in attrs:
-            attrs["min"] = -np.inf
-        if "max" not in attrs:
-            attrs["max"] = np.inf
-        return Clip.convert_attributes(inputs, attrs, params)
+        attr = {}
+        dtype = infer_type(inputs[0])
+
+        if "float" in str(dtype):
+            attr["a_min"] = attrs["floating_min"]
+            attr["a_max"] = attrs["floating_max"]
+        elif "int" in str(dtype):
+            attr["a_min"] = attrs["integral_min"]
+            attr["a_max"] = attrs["integral_max"]
+        else:
+            attr["a_min"] = -np.inf
+            attr["a_max"] = np.inf
+
+        out = AttrCvt("clip")(inputs, attr, params)
+        return out
 
 
 class Slice(OneFlowOpConverter):
     """Operator converter for Slice."""
 
     @classmethod
-    def _common(cls, starts, ends, axes):
-        new_axes = []
-        new_starts = []
-        new_ends = []
-        pop_index = 0
-        for i in range(max(axes) + 1):
-            if i in axes:
-                new_axes.append(i)
-                new_starts.append(starts[pop_index])
-                new_ends.append(ends[pop_index])
-                pop_index += 1
-            else:
-                new_axes.append(i)
-                new_starts.append(0)
-                new_ends.append(np.iinfo(np.int32).max)
-        return new_starts, new_ends, new_axes
-
-    @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        if isinstance(attrs["starts"], int):
-            attrs["starts"] = (attrs["starts"],)
-            attrs["ends"] = (attrs["ends"],)
+        starts = list(attrs["start"])
+        ends = list(attrs["stop"])
+        steps = list(attrs["step"])
 
-        try:
-            # Update the starts and ends according to axes if required.
-            if isinstance(attrs["axes"], int):
-                attrs["axes"] = (attrs["axes"],)
-            if (max(attrs["axes"]) + 1) != len(attrs["axes"]):
-                new_starts, new_ends, new_axes = cls._common(
-                    attrs["starts"], attrs["ends"], attrs["axes"]
-                )
-                attrs["axes"] = new_axes
-                attrs["starts"] = new_starts
-                attrs["ends"] = new_ends
-        except KeyError:
-            pass
-        begin = list(attrs["starts"])
-        end = list(attrs["ends"])
-
-        return _op.strided_slice(inputs[0], begin=begin, end=end)
+        return _op.strided_slice(inputs[0], starts, ends, steps)
 
 
 def get_convert_map():
-    # TODO: 记录实现的oneflow2relay op
+    # supported oneflow2relay op
     return {
         # defs/math
         "bias_add": Add.get_converter(),
@@ -872,7 +842,6 @@ class Softplus(OneFlowOpConverter):
 class oneflow_input(object):
     """
     Dual purpose list or dictionary access object
-    copy from ./onnx.py
     """
     def __init__(self):
         self.input_keys = []
@@ -942,28 +911,26 @@ class OneflowGraph(object):
         self._model_array = {}
         self._input_path_2_name = {}
         self._output_path_2_name = {}
-        self._outputs = []
         self._shape = shape
         self._dtype = dtype
 
         import oneflow
 
         model = oneflow.checkpoint.get(model_dir_path)
-        # model_array是以layer_name为key，以dict('path', 'params')为value的dict
+        # model_array: keys: layer_name，values: dict('path', 'params')
         for layer in model:
             layer_p = {}
-            layer_p['path'] = model[layer].file_path # 模型参数所在路径
-            layer_p['params'] = model[layer].numpy() # 模型各层ndarray
+            layer_p['path'] = model[layer].file_path # get path
+            layer_p['params'] = model[layer].numpy() # get array
             self._model_array[str(layer)] = layer_p
             
         """
-        node_outputs的名字不会直接出现在node.user_conf.input里面
-        所以在构建计算图的时候会导致层与层之间的联系被斩断
-        修补步骤：
-        1. 找到此时node_outputs对应的路径
-        2. 将该路径与node.user_conf.input里面的对应起来，也就是说，需要在__init__的时候创建一个
-            所有node.user_conf.input与其路径的dict
-        3. 在output的new_var的时候将node_outputs的名字换成找到的node_input的名字
+        The names of node_outputs do not appear directly in node.user_conf.input, 
+        so the connection between layers will be cut off when building the graph
+        steps:
+        1. find out the path of node_outputs
+        2. match paths and node.user_conf.input one by one
+        3. If two nodes have the same path, then both correspond to the same op
         """
         for node_name in nodes:
             node = nodes[node_name]
@@ -974,12 +941,17 @@ class OneflowGraph(object):
                     for i in range(len(node_input_paths)):
                         node_input_path = os.path.join(model_dir_path, node_input_paths[i])
                         node_name_ = node_init_name + node_input_path
-                        if node_input_path not in self._input_path_2_name:
-                            self._input_path_2_name[node_input_path] = node_name_
-                        else:
-                            names = list(node_name_)
-                            names.append(self._input_path_2_name[node_input_path])
-                            self._input_path_2_name[node_input_path] = names
+                        # make sure the values of self._input_path_2_name is list
+                        names_temp = []
+                        names_temp.append(node_name_)
+                        if node_input_path in self._input_path_2_name:
+                            names_b = self._input_path_2_name[node_input_path]
+                            while isinstance(names_b, list):
+                                names_temp.append(names_b[0])
+                                names_b = names_b[1:]
+                                if names_b == []:
+                                    break
+                        self._input_path_2_name[node_input_path] = names_temp
                         for param_name in self._model_array:
                             node_p = self._model_array[param_name]
                             if node_input_path == node_p['path']:
@@ -1002,8 +974,8 @@ class OneflowGraph(object):
         for input_name in node.user_conf.input:
             node_input_name = node.name + '-' + input_name
             node_input_paths = getattr(node.user_conf.input[input_name], 's')
-            for i in range(len(node_input_paths)):
-                node_input_path = os.path.join(model_dir_path, node_input_paths[i])
+            for i in node_input_paths:
+                node_input_path = os.path.join(model_dir_path, i)
                 node_input_shape = self._shape[node_input_path]
                 node_input_dtype = self._dtype[node_input_path]
                 node_name = node_input_name + node_input_path
@@ -1015,14 +987,15 @@ class OneflowGraph(object):
                             shape=node_input_shape,
                             dtype=node_input_dtype
                         )
-                    # 查找self._nodes中同路径的node，并copy
                     else:
                         names = self._input_path_2_name[node_input_path]
-                        for i in names:
-                            if i in self._nodes:
-                                node_replace = i
-                                break
-                        op_replace = copy.deepcopy(self._nodes[node_replace])
+                        for k in names:
+                            if k in self._nodes:
+                                node_replace = k
+                        if node_replace is not None:
+                            op_replace = copy.deepcopy(self._nodes[node_replace])
+                        else:
+                            warnings.warn("{} will not be in self._nodes", node_name)
                         self._nodes[node_name] = op_replace
 
 
@@ -1035,21 +1008,25 @@ class OneflowGraph(object):
         model_dir_path: str
             The path of parameter
         freeze_params: bool
-            如果freeze_params为True，则计算图输入为网络第一层的输入，用户无法指定，如：
-            网络第一层输入为: %conv1-in: Tensor[(100, 1, 28, 28), float32]
-            用户指定输入为: %Input_0: Tensor[(1, 1, 28, 28), float32]
-            若freeze_params打开，则conv1-in为计算图输入，而非Input_0
+            If freeze_params is True, 
+            the computational graph input is the input of the first layer of the network, 
+            which cannot be specified by the user, e.g.
+            Default input is: %conv1-in: Tensor[(100, 1, 28, 28), float32]
+            User-defined input is: %Input_0: Tensor[(1, 1, 28, 28), float32]
+            If freeze_params is on, then conv1-in will be the graph input, not Input_0
         user_input: dict
-            用户指定的计算图输入信息
+            User-defined input information for the graph
             {
                 node1_name: 
                 {
-                    'name': node1_name,    # str, like "conv1-in./model_path/Input_0"
+                    'name':  node1_name,   # str, like "conv1-in./model_path/Input_0"
                     'shape': node1_shape,  # tuple
                     'dtype': node1_dtype   # str, like "float16"
                 }
                 ...
             }
+        We recommend that users specify the input by specifying the job function, 
+        rather than by this function
 
         Returns
         -------
@@ -1061,8 +1038,7 @@ class OneflowGraph(object):
         # step 1: get the graph input
         if not freeze_params:
             for node_init_name in user_input:
-                # 我们应该让用户定义如: conv1-in的输入，即第一层网络层的名字 + '-in'
-                if "-in" not in node_init_name:
+                if "Input_0" not in node_init_name:
                     raise KeyError("the key of user_input should be: name of network layer 1(like \'conv1\') + \'-in\'")
                 else:
                     self._nodes[node_init_name] = new_var(
@@ -1073,22 +1049,19 @@ class OneflowGraph(object):
                 self._inputs[node_init_name] = self._nodes[node_init_name]
 
         # step 2: find out if unsupported ops are used
-        # 获取中间计算过程的oneflow2relay op，为后面转换中间计算过程的op做准备
         convert_map = get_convert_map()
         unsupported_ops = set()
         for node_name in nodes:
             node = nodes[node_name]
-            # 开始转换中间计算过程的op(user_op)
             if is_user_op(node):
-                # 这里应该是op的type，而不是神经网络中用户指定的层的名字
+                # op names, not the layer names
                 op_name = node.user_conf.op_type_name
                 if(
-                    # TODO: 这个if语句需要根据op转换的具体工作做修正
                     op_name not in convert_map
                     and op_name not in _identity_list
                 ):
                     unsupported_ops.add(op_name)
-        # 如果遇到不能转换的op，报错
+        # find out the unsupported op
         if unsupported_ops:
             msg = "The following operators are not supported for frontend OneFlow: "
             msg += ", ".join(unsupported_ops)
@@ -1098,7 +1071,7 @@ class OneflowGraph(object):
         for node_name in nodes:
             node = nodes[node_name]
             if is_user_op(node):
-                # 如果有用户自定义的，跳过
+                # If there is a user-defined node, skip the following steps
                 if node_name in self._inputs:
                     continue
 
@@ -1116,8 +1089,6 @@ class OneflowGraph(object):
                     node_input_paths = getattr(node.user_conf.input[input_name], 's')
                     for i in range(len(node_input_paths)):
                         node_input_path = os.path.join(model_dir_path, node_input_paths[i])
-                        node_input_shape = self._shape[node_input_path]
-                        node_input_dtype = self._dtype[node_input_path]
                         node_name_ = node_input_name + node_input_path
                         node_inputs[node_name_] = self._nodes[node_name_]
 
@@ -1136,10 +1107,9 @@ class OneflowGraph(object):
 
                 node_outputs = fix_outputs(op_name, node_outputs)
 
-                # 转换
+                # convert
                 op = self._convert_operator(op_name, node_inputs, op_attr)
 
-                # 判断节点有多少个输出，并相应做出调整
                 if not isinstance(op, _expr.TupleWrapper):
                     outputs_num = 1
                 else:
@@ -1153,24 +1123,15 @@ class OneflowGraph(object):
                     op = fold_constant(op)
                 else:
                     op = _expr.TupleWrapper(fold_constant(op.astuple()), len(op))
-
-                if outputs_num == 1:
-                    if isinstance(node_outputs[0], list):
-                        for i in node_outputs[0]:
-                            self._nodes[i] = op
-                            self._outputs.append(i)
+                
+                op_temp = []
+                op_temp.append(op)
+                for i in range(len(node_outputs)):
+                    if isinstance(node_outputs[i], list):
+                        for k in node_outputs[i]:
+                            self._nodes[k] = op_temp[i]
                     else:
-                        self._nodes[node_outputs[0]] = op
-                        self._outputs.append(node_outputs[0])
-                else:
-                    for i in range(len(node_outputs)):
-                        if isinstance(node_outputs[i], list):
-                            for k in node_outputs[i]:
-                                self._nodes[k] = op
-                                self._outputs.append(k)
-                        else:
-                            self._outputs.append(node_outputs[i])
-                            self._nodes[node_outputs[i]] = op[i]
+                        self._nodes[node_outputs[i]] = op_temp[i]
 
         # step 4: get the outputs
         outputs = []
@@ -1189,10 +1150,10 @@ class OneflowGraph(object):
         nodes = {v: k for k, v in self._nodes.items()}
         free_vars = [nodes[var] for var in free_vars]
 
-        # step 6: make sure the '-in' is the first in self._inputs
-        # free_vars都应该存储到self._inputs里头
+        # step 6: make sure the '-Input_0' is the first in self._inputs
         for free_var in free_vars:
-            self._inputs[free_var] = self._nodes[free_var]
+            if free_var not in self._inputs:
+                self._inputs[free_var] = self._nodes[free_var]
 
         input_names = list(self._inputs.keys())
         for i in range(len(input_names)):
@@ -1244,35 +1205,7 @@ class OneflowGraph(object):
 
 def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
     """
-    Parameters
-    ----------
-    eval_job : job function, type='predict'
-    model_dir_path: str
-        The path of parameter
-    freeze_params: bool
-        如果freeze_params为True，则计算图输入为网络第一层的输入，用户无法指定，如：
-        网络第一层输入为: %conv1-in: Tensor[(100, 1, 28, 28), float32]
-        用户指定输入为: %Input_0: Tensor[(1, 1, 28, 28), float32]
-        若freeze_params打开，则conv1-in为计算图输入，而非Input_0
-    user_input: dict
-        用户指定的计算图节点信息
-        {
-            node1_name: 
-            {
-                'name': node1_name,    # str, like "conv1-in./model_path/Input_0"
-                'shape': node1_shape,  # tuple
-                'dtype': node1_dtype   # str, like "float16"
-            }
-            ...
-        }
-    注意：如果用户需要指定的信息需要完整
-
-    Returns
-    -------
-    mod : tvm.IRModule
-        The relay module for compilation
-    params : dict of str to tvm.nd.NDArray
-        The parameter dict to be used by relay
+    see OneflowGraph.from_oneflow
     """
     try:
         import oneflow
@@ -1291,21 +1224,18 @@ def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
     if freeze_params and user_input is not None:
         warnings.warn("'user_input' will not work, please check the 'freeze_params'")
 
-    # 获取job函数的所有可能信息，用于得到用户的job，导出计算图
+    # Get all possible information of the job function, used to get the user's job
     job_set = flow.get_job_set()
 
-    # 创建一个以node.name为key，以node为value的字典，避免后续大量for循环查找浪费时间
+    # get all nodes TODO(hujiakui): only support 0.4.0
     nodes = {}
     shape = {}
     dtype = {}
 
-    # this will spend a long time
-    # TODO: only support 0.4.0
     for job in job_set.job:
         if job.job_conf.job_name == eval_job.__name__:
             for node in job.net.op:
                 nodes[node.name] = node
-            # 不需要跑出来中间变量，这里都存储好了
             for lbn in job.helper.lbn2logical_blob_desc:
                 lbd = job.helper.lbn2logical_blob_desc[lbn]
                 node_path = os.path.join(model_dir_path, lbn)
@@ -1321,6 +1251,5 @@ def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
             nodes=nodes, model_dir_path=model_dir_path, 
             freeze_params=freeze_params, user_input=user_input
         )
-    # print(mod)
 
     return mod, params
