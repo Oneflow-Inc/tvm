@@ -360,10 +360,14 @@ class Conv(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         # The kernel is imported from model_dir_path, without the "out_0" logo, etc.
         # The data is obtained through the graph, its op contains "Input_0"
+        in_names = ["Input_0"]
+        kernel_names = ["/weight", "out_0", "/in"]
         for i in inputs:
-            if "Input_0" in str(i):
+            IN_NAMES = any(x in str(i) for x in in_names)
+            KERNEL_NAMES = any(x in str(i) for x in kernel_names)
+            if IN_NAMES:
                 data = i
-            elif "weight" in str(i) and "out_0" not in str(i) and "-in" not in str(i):
+            elif KERNEL_NAMES:
                 kernel = i
             else:
                 data = i
@@ -418,10 +422,14 @@ class ConvTranspose(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
+        in_names = ["Input_0"]
+        kernel_names = ["/weight", "out_0", "/in"]
         for i in inputs:
-            if "Input_0" in str(i):
+            IN_NAMES = any(x in str(i) for x in in_names)
+            KERNEL_NAMES = any(x in str(i) for x in kernel_names)
+            if IN_NAMES:
                 data = i
-            elif "weight" in str(i) and "out_0" not in str(i):
+            elif KERNEL_NAMES:
                 kernel = i
             else:
                 data = i
@@ -457,6 +465,93 @@ class ConvTranspose(OneFlowOpConverter):
             custom_check=dimension_constraint_conv(),
         )([data, kernel], attr, params)
 
+        return out
+
+
+class Upsample(OneFlowOpConverter):
+    """Operator converter for Upsample (nearest mode)."""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        in_names = ["Input_0"]
+        kernel_names = ["/weight", "out_0", "/in"]
+        for i in inputs:
+            IN_NAMES = any(x in str(i) for x in in_names)
+            KERNEL_NAMES = any(x in str(i) for x in kernel_names)
+            if IN_NAMES:
+                data = i
+            elif KERNEL_NAMES:
+                kernel = i
+            else:
+                data = i
+        input_shape = infer_shape(data)
+        dims = len(input_shape)
+
+        scales = attrs.get("scales")
+        if not scales:
+            # Here we are going to higher OPSET version.
+            assert len(inputs) == 2, "Upsample op takes 2 inputs, {} given".format(len(inputs))
+
+            if get_name(kernel) in params:
+                scales = params[kernel.name_hint].numpy()
+            else:
+                scales = kernel
+        if isinstance(scales, _expr.Constant):
+            scales = list(scales.data.numpy())
+        if not isinstance(scales, _expr.Expr):
+            assert scales[0] == 1.0 and scales[1] == 1.0
+
+        mode = attrs.get("mode")
+        if mode == "nearest":
+            method = "nearest_neighbor"
+        elif mode == "linear":
+            method = "trilinear" if dims == 5 else "bilinear"
+        else:
+            raise tvm.error.OpAttributeInvalid(
+                'Value {} in attribute "mode" of operator Upsample is not valid.'.format(mode)
+            )
+
+        # in 3d case, we use the purely static op
+        if dims == 5:
+            if isinstance(scales, _expr.Expr):
+                scale_h = _op.take(scales, _op.const(3))
+                scale_w = _op.take(scales, _op.const(4))
+                scale_d = _op.take(scales, _op.const(1))
+            else:
+                assert len(scales) == 5
+                scale_h = scales[-2]
+                scale_w = scales[-1]
+                scale_d = scales[-3]
+
+            layout = "NCDHW"
+            out = _op.nn.upsampling3d(
+                data,
+                scale_d,
+                scale_h,
+                scale_w,
+                layout=layout,
+                method=method,
+                coordinate_transformation_mode="asymmetric",
+            )
+        # in 2d case, use dynamic op
+        else:
+            if isinstance(scales, _expr.Expr):
+                scale_h = _op.take(scales, _op.const(3))
+                scale_w = _op.take(scales, _op.const(4))
+            else:
+                assert len(scales) == 4
+                scale_h = scales[-2]
+                scale_w = scales[-1]
+            layout = "NCHW"
+
+            out = _op.nn.upsampling(
+                inputs[0],
+                scale_h,
+                scale_w,
+                layout=layout,
+                method=method,
+                align_corners=False,
+            )
         return out
 
 
@@ -499,17 +594,12 @@ class BatchNorm(OneFlowOpConverter):
         return out[0]
 
 
-class InstanceNorm(OneFlowOpConverter):
-    """Operator converter for InstanceNorm."""
-
-    @classmethod
-    # TODO(hujiakui): sort the inputs
-    def _impl_v1(cls, inputs, attrs, params):
-        return AttrCvt(op_name="instance_norm")(inputs, attrs, params)
+class LayerNorm(OneFlowOpConverter):
+    """Operator converter for LayerNorm"""
 
     
 class Flatten(OneFlowOpConverter):
-    """Operator converter for Flatten."""
+    """Operator converter for Flatten"""
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
@@ -530,7 +620,7 @@ class Flatten(OneFlowOpConverter):
 
 
 class MatMul(OneFlowOpConverter):
-    """Operator converter for MatMul."""
+    """Operator converter for MatMul"""
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
@@ -538,8 +628,8 @@ class MatMul(OneFlowOpConverter):
             len(inputs)
         )
         # Similar to 'class Conv'
-        true_names = ["-b"]
-        false_names = ["-in", "out_0"]
+        true_names = ["/b"]
+        false_names = ["/in", "out_0", "Input_0"]
         for i in inputs:
             T_NAMES = any(x in str(i) for x in true_names)
             F_NAMES = any(x in str(i) for x in false_names)
@@ -568,8 +658,55 @@ class MatMul(OneFlowOpConverter):
         return _op.nn.dense(matmul_a, matmul_b, units=channels)
 
 
+class Reduce(OneFlowOpConverter):
+    """Operator converter for reduce ops"""
+
+    name = ""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        attr = {
+            "axis": attrs.get("axes", 0), 
+            "keepdims": attrs.get("keepdims", True)
+            }
+        return AttrCvt(cls.name)(inputs, attr)
+
+
+class ReduceMax(Reduce):
+    """Operator converter for ReduceMax"""
+
+    name = "max"
+
+
+class ReduceMin(Reduce):
+    """Operator converter for ReduceMin"""
+
+    name = "min"
+
+
+class ReduceSum(Reduce):
+    """Operator converter for ReduceSum"""
+
+    name = "sum"
+
+
+class ReduceMean(Reduce):
+    """Operator converter for ReduceMean"""
+
+    name = "mean"
+
+
+class Square(OneFlowOpConverter):
+    """Operator converter for square"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        assert len(inputs) == 1, "Square op {} take 1 inputs, {} given".format(cls.name, len(inputs))
+        return _op.multiply(inputs[0], inputs[0])
+
+
 class Add(OneFlowOpConverter):
-    """Operator converter for Add."""
+    """Operator converter for Add"""
 
     name = "add"
 
@@ -578,8 +715,8 @@ class Add(OneFlowOpConverter):
         assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
         axis = int(attrs.get("axis", 0))
 
-        true_names = ["-b"]
-        false_names = ["-in", "out_0", "Input_0"]
+        true_names = ["/b"]
+        false_names = ["/in", "out_0", "Input_0"]
 
         for i in inputs:
             T_NAMES = any(x in str(i) for x in true_names)
@@ -593,11 +730,9 @@ class Add(OneFlowOpConverter):
         add_shape = infer_shape(add_a)
         if len(add_shape) > 2:
             add_b = _op.expand_dims(add_b, axis=axis, num_newaxis=len(add_shape)-2)
+        add_b_shape = list(infer_shape(add_b))
+        add_b_shape.insert(0, add_shape[0])
 
-        add_b_shape = copy.deepcopy(list(infer_shape(add_b)))
-
-        # TODO
-        add_b_shape.insert(1, 1)
         add_b = _op.reshape(add_b, tuple(add_b_shape))
         out = get_relay_op(cls.name)(add_a, add_b)
 
@@ -612,7 +747,8 @@ class BroadcastMath(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
-        beta_names = ["-b", "-beta", "-gamma", "_mean", "_variance"]
+        beta_names = ["/b", "beta", "gamma", "mean", "variance"]
+
         for i in inputs:
             T_NAMES = any([x in str(i) for x in beta_names])
             if T_NAMES and "Input_0" not in str(i):
@@ -620,25 +756,62 @@ class BroadcastMath(OneFlowOpConverter):
             else:
                 input_a = i
 
-        return get_relay_op(cls.name)(input_a, input_b)
+        # Notes: in some ops: layer norm、div、...
+        # the input_a and input_b are all from Input_0
+        # TODO: div doesn't work(instance norm)
+        if cls.name == "divide":
+            length = []
+            for i in inputs:
+                length.append(len(str(i)))
+            for i in inputs:
+                if len(str(i)) > max(length):
+                    input_a = i
+                else:
+                    input_b = i
+            print(infer_shape(input_a), infer_shape(input_b))
+        if cls.name == "subtract":
+            length = []
+            for i in inputs:
+                length.append(len(str(i)))
+            for i in inputs:
+                if len(str(i)) > max(length):
+                    input_a = i
+                else:
+                    input_b = i
+            print(infer_shape(input_a), infer_shape(input_b))
+        try:
+            return get_relay_op(cls.name)(input_a, input_b)
+        except UnboundLocalError:
+            print(cls.name)
+            for i in inputs:
+                print(i)
+                print()
+            print()
+            return get_relay_op(cls.name)(*inputs)
 
 
-class Mul_broadcast(BroadcastMath):
+class BroadcastMul(BroadcastMath):
     """Operator converter for Mul broadcast"""
 
     name = "multiply"
 
 
-class Add_broadcast(BroadcastMath):
+class BroadcastAdd(BroadcastMath):
     """Operator converter for Add broadcast"""
 
     name = "add"
 
 
-class Sub_broadcast(BroadcastMath):
+class BroadcastSub(BroadcastMath):
     """Operator converter for Sub broadcast"""
 
     name = "subtract"
+
+
+class BroadcastDiv(BroadcastMath):
+    """Operator converter for Div broadcast"""
+
+    name = "divide"
 
 
 class Unary(OneFlowOpConverter):
@@ -660,7 +833,7 @@ class Absolute(Unary):
     name = "abs"
 
 
-class Add_n(OneFlowOpConverter):
+class AddN(OneFlowOpConverter):
     """Operator converter for Add_n"""
 
     @classmethod
@@ -673,7 +846,7 @@ class Add_n(OneFlowOpConverter):
         return res
 
 
-class Add_scalar(OneFlowOpConverter):
+class ScalarAdd(OneFlowOpConverter):
     """Operator convert for Add_scalar"""
 
     @classmethod
@@ -684,6 +857,21 @@ class Add_scalar(OneFlowOpConverter):
             return inputs[0] + _expr.const(attrs["int_operand"])
         elif attrs.get("has_float_operand", False):
             return inputs[0] + _expr.const(attrs["float_operand"])
+        else:
+            raise AttributeError("please check if has_int_operand or has_float_operand in your attrs")
+
+
+class ScalarMul(OneFlowOpConverter):
+    """Operator convert for Mul_scalar"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        assert len(inputs) == 1, "add_scalar take == 1 inputs, but {} given.".format(len(inputs))
+
+        if attrs.get("has_int_operand", False):
+            return inputs[0] * _expr.const(attrs["int_operand"])
+        elif attrs.get("has_float_operand", False):
+            return inputs[0] * _expr.const(attrs["float_operand"])
         else:
             raise AttributeError("please check if has_int_operand or has_float_operand in your attrs")
 
@@ -798,7 +986,7 @@ class Elu(OneFlowOpConverter):
 class PReLU(OneFlowOpConverter):
     """Operator converter for PReLU"""
 
-    classmethod
+    @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "PReLU need 2 inputs, but {} given".format(len(inputs))
         for i in inputs:
@@ -806,11 +994,14 @@ class PReLU(OneFlowOpConverter):
                 prelu_a = i
             else:
                 prelu_b = i
+
         input_shape = shape_of(prelu_a)
         alpha = _op.broadcast_to_like(prelu_b, prelu_a)
         alpha = _op.reshape(alpha, [-1])
+
         output = _op.nn.prelu(_op.reshape(prelu_a, [-1]), alpha, axis=0)
-        return _op.reshape(output, input_shape)
+        out = _op.reshape(output, input_shape)
+        return out
 
 
 class Selu(OneFlowOpConverter):
@@ -934,24 +1125,21 @@ class OneHot(OneFlowOpConverter):
         return _op.one_hot(indices, on_value, off_value, depth, axis, dtype=dtype)
 
 
-# TODO(jkhu29): RNN/LSTM/GRU
-class RNN(OneFlowOpConverter):
-    """Operator converter for RNN/LSTM/GRU"""
-
-    @classmethod
-    def _impl_v1(cls, inputs, attrs, params):
-        pass
-
-
 def get_convert_map():
     # supported oneflow2relay op
     return {
         # defs/math
         "bias_add": Add.get_converter(),
-        "scalar_add": Add_scalar.get_converter(),
-        "broadcast_add": Add_broadcast.get_converter(),
-        "broadcast_mul": Mul_broadcast.get_converter(),
-        "broadcast_sub": Sub_broadcast.get_converter(),
+        "scalar_add": ScalarAdd.get_converter(),
+        "scalar_mul": ScalarMul.get_converter(),
+        "reduce_sum": ReduceSum.get_converter(),
+        "reduce_max": ReduceMax.get_converter(),
+        "reduce_min": ReduceMin.get_converter(),
+        "reduce_mean": ReduceMean.get_converter(),
+        "broadcast_add": BroadcastAdd.get_converter(),
+        "broadcast_mul": BroadcastMul.get_converter(),
+        "broadcast_sub": BroadcastSub.get_converter(),
+        "broadcast_div": BroadcastDiv.get_converter(),
         "log": Renamer("log"),
         "acos": Renamer("acos"),
         "acosh": Renamer("acosh"),
@@ -970,8 +1158,10 @@ def get_convert_map():
         "floor": Renamer("floor"),
         "ceil": Renamer("ceil"),
         "round": Renamer("round"),
-        "add_n": Add_n.get_converter(),
+        "add_n": AddN.get_converter(),
+        "sqrt": Renamer("sqrt"),
         "rsqrt": Renamer("rsqrt"),
+        "square": Square.get_converter(),
         # defs/activation
         "sigmoid": Renamer("sigmoid"),
         "relu": Renamer("relu"),
@@ -1081,7 +1271,6 @@ class OneflowGraph(object):
         import oneflow
 
         model = oneflow.checkpoint.get(model_dir_path)
-        model.pop("System-Train-TrainStep-TrainNet")
         # model_array: keys: layer_name，values: dict('path', 'params')
         for layer_name in model:
             layer = model[layer_name]
@@ -1090,6 +1279,8 @@ class OneflowGraph(object):
             if layer.has_meta_info_:
                 layer_node['params'] = layer.numpy() # get array
             else:
+                if "System-Train" in layer_name:
+                    continue
                 shape = tuple(nodes[layer_name].variable_conf.shape.dim)
                 dtype = FLOW_2_NP_DTYPE[nodes[layer_name].variable_conf.data_type]
                 array = np.fromfile(layer_node['path'], dtype=dtype)
@@ -1246,6 +1437,7 @@ class OneflowGraph(object):
 
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
+                print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -1275,6 +1467,7 @@ class OneflowGraph(object):
                             warnings.warn("{} is not in known path".format(node_output_path))
 
                 node_outputs = fix_outputs(op_name, node_outputs)
+                print()
 
                 # convert
                 op = self._convert_operator(op_name, node_inputs, op_attr)
