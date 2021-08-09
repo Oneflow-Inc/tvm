@@ -1,4 +1,5 @@
 import os
+import re
 import copy
 import warnings
 
@@ -758,35 +759,37 @@ class BroadcastMath(OneFlowOpConverter):
 
         # Notes: in some ops: layer norm、div、...
         # the input_a and input_b are all from Input_0
-        # TODO: div doesn't work(instance norm)
+        # TODO: no info, can't do this
         if cls.name == "divide":
             length = []
             for i in inputs:
                 length.append(len(str(i)))
             for i in inputs:
-                if len(str(i)) > max(length):
+                if len(str(i)) == max(length):
                     input_a = i
                 else:
                     input_b = i
-            print(infer_shape(input_a), infer_shape(input_b))
         if cls.name == "subtract":
             length = []
             for i in inputs:
                 length.append(len(str(i)))
             for i in inputs:
-                if len(str(i)) > max(length):
-                    input_a = i
-                else:
+                if len(str(i)) == max(length):
                     input_b = i
-            print(infer_shape(input_a), infer_shape(input_b))
+                else:
+                    input_a = i
+            # print(input_a)
+            # print()
+            # print(input_b)
+            # print()
         try:
             return get_relay_op(cls.name)(input_a, input_b)
         except UnboundLocalError:
-            print(cls.name)
-            for i in inputs:
-                print(i)
-                print()
-            print()
+            # print(cls.name)
+            # for i in inputs:
+            #     print(i)
+            #     print()
+            # print()
             return get_relay_op(cls.name)(*inputs)
 
 
@@ -1255,37 +1258,20 @@ class OneflowGraph(object):
     dtype : dict of str to str
         The input types to the graph
     """
-    def __init__(self, shape, dtype, nodes, model_dir_path) -> None:
+    def __init__(self, shape, dtype, nodes, model_array, model_dir_path) -> None:
         self._nodes = {}
         self._params = {}
         self._inputs = {}
         self._num_input = 0
         self._num_param = 0
         self._input_names = []
-        self._model_array = {}
+        self._model_array = model_array
         self._input_path_2_name = {}
         self._output_path_2_name = {}
         self._shape = shape
         self._dtype = dtype
 
         import oneflow
-
-        model = oneflow.checkpoint.get(model_dir_path)
-        # model_array: keys: layer_name，values: dict('path', 'params')
-        for layer_name in model:
-            layer = model[layer_name]
-            layer_node = {}
-            layer_node['path'] = layer.file_path # get path
-            if layer.has_meta_info_:
-                layer_node['params'] = layer.numpy() # get array
-            else:
-                if "System-Train" in layer_name:
-                    continue
-                shape = tuple(nodes[layer_name].variable_conf.shape.dim)
-                dtype = FLOW_2_NP_DTYPE[nodes[layer_name].variable_conf.data_type]
-                array = np.fromfile(layer_node['path'], dtype=dtype)
-                layer_node['params'] = array.reshape(shape)
-            self._model_array[layer_name] = layer_node
 
         """
         The names of node_outputs do not appear directly in node.user_conf.input, 
@@ -1437,7 +1423,7 @@ class OneflowGraph(object):
 
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
-                print(op_name, op_attr)
+                # print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -1467,7 +1453,7 @@ class OneflowGraph(object):
                             warnings.warn("{} is not in known path".format(node_output_path))
 
                 node_outputs = fix_outputs(op_name, node_outputs)
-                print()
+                # print()
 
                 # convert
                 op = self._convert_operator(op_name, node_inputs, op_attr)
@@ -1565,14 +1551,12 @@ class OneflowGraph(object):
         return sym
 
 
-def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
+def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
     """
     see OneflowGraph.from_oneflow
     """
     try:
         import oneflow
-
-        oneflow.config.enable_legacy_model_io(False)
 
         if 'snapshot_done' not in os.listdir(model_dir_path):
             raise IndexError("'snapshot_done' is not in the model path, please determine whether the model has been trained")
@@ -1585,27 +1569,42 @@ def from_oneflow(eval_job, model_dir_path, freeze_params=True, user_input=None):
     if freeze_params and user_input is not None:
         warnings.warn("'user_input' will not work, please check the 'freeze_params'")
 
-    # Get all possible information of the job function, used to get the user's job
-    job_set = oneflow.experimental.get_job_set()
-
-    # get all nodes TODO(hujiakui): only support 0.4.0
+    # get all nodes
     nodes = {}
     shape = {}
     dtype = {}
 
-    for job in job_set.job:
-        if job.job_conf.job_name == eval_job.__name__:
-            for node in job.net.op:
-                nodes[node.name] = node
-            for lbn in job.helper.lbn2logical_blob_desc:
-                lbd = job.helper.lbn2logical_blob_desc[lbn]
-                node_path = os.path.join(model_dir_path, lbn)
-                node_shape = tuple(lbd.shape.dim)
-                node_dtype = lbd.data_type
-                shape[node_path] = node_shape
-                dtype[node_path] = FLOW_2_STR_DTYPE[node_dtype]
+    # get info of nodes
+    graph_str = repr(graph)
+    p1 = re.compile("\[.*?\]", re.S)
+    types = ["INPUT", "PARAMETER", "BUFFER", "OUTPUT"]
+    for t in types:
+        data = re.finditer(t+":.*", graph_str)
+        for i in data:
+            attrs = i.group().split(":")
+            data_size = tuple(map(int, re.findall(p1, attrs[2])[0][1:-1].split(", ")))
+            if t == "INPUT" or t == "OUTPUT":
+                shape[attrs[1][1:]] = data_size
+            else:
+                shape[attrs[1]] = data_size
 
-    g = OneflowGraph(shape, dtype, nodes, model_dir_path)
+    # get graph proto, if you don't _compile the graph, the _graph_proto will be None
+    graph_input = re.search("INPUT:.*", graph_str).group().split(":")
+    shape_input = tuple(map(int, re.findall(p1, graph_input[2])[0][1:-1].split(", ")))
+    if not graph._is_compiled:
+        _ = graph._compile(np.random.rand(shape_input))
+    graph_proto = graph._graph_proto
+
+    # get nodes
+    for node in graph_proto.net.op:
+        nodes[op.name] = node
+
+    # get model params
+    model_array = {}
+    for param in graph._variable_conf:
+        model_array[graph._variables_conf[param].name] = param.numpy()
+
+    g = OneflowGraph(shape, dtype, nodes, model_array, model_dir_path)
 
     # Use the graph proto as a scope so that ops can access other nodes if needed.
     mod, params = g.from_oneflow(
