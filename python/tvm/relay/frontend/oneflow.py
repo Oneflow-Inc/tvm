@@ -1,4 +1,4 @@
-import os
+import os, sys
 import re
 import copy
 import warnings
@@ -68,7 +68,7 @@ def is_user_op(node):
 
 def is_output_op(node):
     # Determine if the the node is the output of graph
-    return node.WhichOneof("op_type") == "return_conf"
+    return node.WhichOneof("op_type") == "output_conf"
 
 
 def is_param_op(node):
@@ -131,16 +131,6 @@ def parse_attr(attr):
     return attrs
 
 
-def fix_outputs(op_name, outputs):
-    if op_name.lower() == "dropout":
-        if len(outputs) == 1:
-            return outputs
-        # TODO(zhreshold): support dropout mask? `onnx.py`
-        outputs = outputs[:-1]
-
-    return outputs
-
-
 def shape_of(x, dtype="int64"):
     ttype = infer_type(x).checked_type
     if not _ty.is_dynamic(ttype):
@@ -150,18 +140,9 @@ def shape_of(x, dtype="int64"):
     return _op.shape_of(x, dtype)
 
 
-def dimension_constraint_conv():
+def dimension_constraint():
     def _dim_check(attrs):
         if len(attrs["kernel_size"]) in [1, 2, 3]:
-            return True
-        return False
-
-    return _dim_check, "Only 1d, 2d and 3d kernel supported."
-
-
-def dimension_constraint_pool():
-    def _dim_check(attrs):
-        if len(attrs["pool_size"]) in [1, 2, 3]:
             return True
         return False
 
@@ -258,7 +239,7 @@ class OneFlowOpConverter:
 
 class Pool(OneFlowOpConverter):
     """A helper class for pool op converters."""
-
+    # TODO: need more test
     name = ""
 
     @classmethod
@@ -277,41 +258,14 @@ class Pool(OneFlowOpConverter):
             raise tvm.error.OpAttributeInvalid(msg.format(attrs["data_format"]))
         attrs.pop("data_format")
 
-        if "padding" in attrs:
-            if attrs["padding"].lower() in ("same_upper", "same_lower"):
-                pad_v = attrs.get("padding_before", [0, 0])
-                pad_h = attrs.get("padding_after", [0, 0])
-                if "avg_pool" not in cls.name:
-                    if "int" in input_dtype:
-                        pad_val = np.iinfo(np.dtype(input_dtype)).min
-                    else:
-                        pad_val = np.finfo(np.dtype(input_dtype)).min
-                    data = autopad(
-                        data,
-                        attrs.get("strides", [1] * (ndim - 2)),
-                        attrs["pool_size"],
-                        [1] * ndim,
-                        ndim,
-                        pad_value=pad_val,
-                        mode=attrs["padding"],
-                    )
-                attrs["padding"] = [pad_v[0], pad_v[1], pad_h[0], pad_h[1]]
-            elif attrs["padding"].lower() == "valid":
-                attrs["padding"] = tuple([0 for _ in range(ndim - 2)])
-            else:
-                msg = 'Value {} in attribute "padding" of operator {} is invalid.'
-                raise tvm.error.OpAttributeInvalid(msg.format(attrs["padding"], cls.name))
-        
-        if "avg_pool" in cls.name:
-            attrs["count_include_pad"] = False
-
         out = AttrCvt(
             op_name=cls.name,
             transforms={
+                "kernel_size": "pool_size",
                 "dilations": ("dilation", 1),
             },
-            ignores=["padding_before", "padding_after"],
-            custom_check=dimension_constraint_pool(),
+            ignores=["return_indices", "stride", "divisor_override"],
+            custom_check=dimension_constraint(),
         )([data], attrs, params)
 
         return out
@@ -359,10 +313,11 @@ class Conv(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
+        # TODO: there are key "weight" and "in" in op
         # The kernel is imported from model_dir_path, without the "out_0" logo, etc.
         # The data is obtained through the graph, its op contains "Input_0"
-        in_names = ["Input_0"]
-        kernel_names = ["/weight", "out_0", "/in"]
+        in_names = ["0-input_0"]
+        kernel_names = [".weight"]
         for i in inputs:
             IN_NAMES = any(x in str(i) for x in in_names)
             KERNEL_NAMES = any(x in str(i) for x in kernel_names)
@@ -408,7 +363,7 @@ class Conv(OneFlowOpConverter):
                 "group": ("groups", 1),
             },
             ignores=["data_format", "filters", "padding_after", "padding_before"],
-            custom_check=dimension_constraint_conv(),
+            custom_check=dimension_constraint(),
         )([data, kernel], attrs, params)
 
         # If this was a group_conv1d, squish output back to NCW.
@@ -463,7 +418,7 @@ class ConvTranspose(OneFlowOpConverter):
                 "group": ("groups", 1),
             },
             disables=["output_shape", "filters", "padding_after", "padding_before"],
-            custom_check=dimension_constraint_conv(),
+            custom_check=dimension_constraint(),
         )([data, kernel], attr, params)
 
         return out
@@ -570,16 +525,16 @@ class BatchNorm(OneFlowOpConverter):
         # sort the inputs
         sorted_inputs = copy.deepcopy(inputs)
         for i in inputs:
-            IN_NAMES = "Input_0" in str(i)
+            IN_NAMES = "0-input_0" in str(i)
             if IN_NAMES:
                 sorted_inputs[0] = i
-            elif 'gamma' in str(i) and not IN_NAMES:
+            elif 'weight' in str(i) and not IN_NAMES:
                 sorted_inputs[1] = i
-            elif 'beta' in str(i) and not IN_NAMES:
+            elif 'bias' in str(i) and not IN_NAMES:
                 sorted_inputs[2] = i
             elif 'mean' in str(i) and not IN_NAMES:
                 sorted_inputs[3] = i
-            elif 'variance' in str(i) and not IN_NAMES:
+            elif 'var' in str(i) and not IN_NAMES:
                 sorted_inputs[4] = i
 
         axis = attrs.get("axis", 3)
@@ -629,8 +584,8 @@ class MatMul(OneFlowOpConverter):
             len(inputs)
         )
         # Similar to 'class Conv'
-        true_names = ["/b"]
-        false_names = ["/in", "out_0", "Input_0"]
+        true_names = ["weight"]
+        false_names = ["0-input_0"]
         for i in inputs:
             T_NAMES = any(x in str(i) for x in true_names)
             F_NAMES = any(x in str(i) for x in false_names)
@@ -736,6 +691,20 @@ class Add(OneFlowOpConverter):
 
         add_b = _op.reshape(add_b, tuple(add_b_shape))
         out = get_relay_op(cls.name)(add_a, add_b)
+
+        return out
+
+
+class Expand(OneFlowOpConverter):
+    """Operator converter for Expand"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        input_shape = infer_shape(inputs[0])
+        assert input_shape == attrs["in_shape"], "shape wrong"
+
+        new_shape = attrs["out_shape"]
+        out = _op.broadcast_to(inputs[0], shape=new_shape)
 
         return out
 
@@ -1171,8 +1140,8 @@ def get_convert_map():
         "prelu": PReLU.get_converter(),
         # defs/nn
         "conv2d": Conv2d.get_converter(),
-        "max_pool_2d": MaxPool2d.get_converter(),
-        "avg_pool_2d": AveragePool2d.get_converter(),
+        "maxpool_2d": MaxPool2d.get_converter(),
+        "avgpool_2d": AveragePool2d.get_converter(),
         "dropout": Dropout.get_converter(),
         "normalization": BatchNorm.get_converter(),
         # defs/tensor
@@ -1180,8 +1149,10 @@ def get_convert_map():
         "concat": Concat.get_converter(),
         "clip_by_scalar": Clip.get_converter(),
         "slice": Slice.get_converter(),
+        "expand": Expand.get_converter(),
         # defs/others
         "reshape": Reshape.get_converter(),
+        "flatten": Flatten.get_converter(),
     }
 
 
@@ -1258,20 +1229,54 @@ class OneflowGraph(object):
     dtype : dict of str to str
         The input types to the graph
     """
-    def __init__(self, shape, dtype, nodes, model_array, model_dir_path) -> None:
+    def __init__(self, shape, dtype, nodes, model_dir_path) -> None:
         self._nodes = {}
         self._params = {}
         self._inputs = {}
         self._num_input = 0
         self._num_param = 0
         self._input_names = []
-        self._model_array = model_array
+        self._model_array = {}
         self._input_path_2_name = {}
         self._output_path_2_name = {}
         self._shape = shape
         self._dtype = dtype
 
         import oneflow
+
+        model = oneflow.load(model_dir_path)
+        # model_array: keys: layer_name，values: dict('path', 'params')
+        for layer_name in model:
+            layer = model[layer_name]
+            layer_node = {}
+            layer_node['path'] = layer.file_path     # get path
+            if layer.has_meta_info_:
+                layer_node['params'] = layer.numpy() # get array
+            else:
+                if "System-Train" in layer_name:
+                    continue
+                node_name = "m." + layer_name
+                shape = self._shape[node_name]
+                dtype = self._dtype[node_name]
+                array = np.fromfile(layer_node['path'], dtype=dtype)
+                layer_node['params'] = array.reshape(shape)
+            self._model_array[layer_name] = layer_node
+
+        # 所有模型参数都在这里面了
+        # for k in self._model_array:
+            # print(k, self._model_array[k]['params'].shape)
+
+        # 所有节点的都在这里面了，包括保存的参数与中间变量
+        # for k in self._shape:
+        #     print(k, self._shape[k])
+        """
+        key分为
+        1. 模型参数param: m.layer4.1.bn1.weight
+        2. 模型buffer: m.layer4.1.bn1.running_mean
+        3. 节点输入: m.layer4.1.bn1-input_0
+        4. 节点输出: m.layer4.1.bn1-output_0
+        这些作为节点的唯一标识
+        """
 
         """
         The names of node_outputs do not appear directly in node.user_conf.input, 
@@ -1285,68 +1290,98 @@ class OneflowGraph(object):
             node = nodes[node_name]
             if is_user_op(node):
                 for input_name in node.user_conf.input:
-                    node_init_name = os.path.join(node_name, input_name)
                     node_input_paths = getattr(node.user_conf.input[input_name], 's')
-                    for i in range(len(node_input_paths)):
-                        node_input_path = os.path.join(model_dir_path, node_input_paths[i])
-                        node_name_ = node_init_name + node_input_path
-                        # make sure the values of self._input_path_2_name is list
-                        names_temp = []
-                        names_temp.append(node_name_)
-                        if node_input_path in self._input_path_2_name:
-                            names_b = self._input_path_2_name[node_input_path]
-                            while isinstance(names_b, list):
-                                names_temp.append(names_b[0])
-                                names_b = names_b[1:]
-                                if names_b == []:
-                                    break
-                        self._input_path_2_name[node_input_path] = names_temp
+                    for node_input_path in node_input_paths:
+                        # TODO: how to remove the "m." quickly
+                        node_path = os.path.join(model_dir_path, node_input_path.replace("m.", ""))
+                        # # make sure the values of self._input_path_2_name is list
+                        # names_temp = []
+                        # names_temp.append(node_name_)
+                        # if node_input_path in self._input_path_2_name:
+                        #     names_b = self._input_path_2_name[node_input_path]
+                        #     while isinstance(names_b, list):
+                        #         names_temp.append(names_b[0])
+                        #         names_b = names_b[1:]
+                        #         if names_b == []:
+                        #             break
+                        node_input_name = node_input_path.split("/")[0]
+                        self._input_path_2_name[node_path] = node_input_name
                         for param_name in self._model_array:
                             node_p = self._model_array[param_name]
-                            if node_input_path == node_p['path']:
+                            if node_path == node_p['path']:
                                 node_array = node_p['params']
-                                self._params[node_name_] = node_array
-                                self._nodes[node_name_] = new_var(
-                                    node_name_, 
+                                self._params[node_input_name] = node_array
+                                self._nodes[node_input_name] = new_var(
+                                    node_input_name, 
                                     shape=node_array.shape,
                                     dtype=str(node_array.dtype)
                                 )
+                                break
             elif is_output_op(node):
-                output_path = os.path.join(model_dir_path, getattr(node.return_conf, "in"))
-                self._output_path_2_name[output_path] = node_name + output_path
+                node_output_path = getattr(node.output_conf, "in")
+                output_path = os.path.join(
+                    model_dir_path, 
+                    getattr(node.output_conf, "in").replace("m.", "")
+                )
+                self._output_path_2_name[output_path] = node_name
+        
+        # for k in self._input_path_2_name:
+            # print(k)
+        for k in self._output_path_2_name:
+            print(k, self._output_path_2_name[k])
+        # for k in self._shape:
+        #     print(k)
+        # for k in self._nodes:
+        #     print(k)
 
 
     def _parse_input(self, node, model_dir_path):
         for input_name in node.user_conf.input:
-            node_input_name = os.path.join(node.name, input_name)
             node_input_paths = getattr(node.user_conf.input[input_name], 's')
             for i in node_input_paths:
-                node_input_path = os.path.join(model_dir_path, i)
-                node_input_shape = self._shape[node_input_path]
-                node_input_dtype = self._dtype[node_input_path]
-                node_name = node_input_name + node_input_path
-                # if node_name not in self._nodes and node_input_path not in self._input_path_2_name
-                if node_name not in self._nodes:
-                    if "Input_0" in node_name or node_input_path not in self._input_path_2_name:
-                        self._nodes[node_name] = new_var(
-                            node_name,
+                node_input = i.split("/")[0]
+                node_input_shape = self._shape[node_input]
+                node_input_dtype = self._dtype[node_input]
+                node_path = os.path.join(model_dir_path, i.replace("m.", ""))
+
+                if node_input not in self._nodes:
+                    if node_path not in self._input_path_2_name or "0-input_0" in node_input:
+                        self._nodes[node_input] = new_var(
+                            node_input,
                             shape=node_input_shape,
-                            dtype=node_input_dtype
+                            dtype=node_input_dtype,
                         )
                     else:
-                        names = self._input_path_2_name[node_input_path]
+                        names = self._input_path_2_name[node_path]
+                        node_replace = None
                         for k in names:
                             if k in self._nodes:
                                 node_replace = k
                         if node_replace is not None:
                             op_replace = copy.deepcopy(self._nodes[node_replace])
                         else:
-                            warnings.warn("{} will not be in self._nodes", node_name)
+                            warnings.warn("{} will not be in self._nodes", node_input)
                         self._nodes[node_name] = op_replace
 
 
+    def _parse_output(self, op_name, outputs):
+        for o in outputs:
+            if "0-output_0" not in o:
+                new_o = o.replace("-"+op_name, "-output")
+                new_o = new_o.split("_")[0] + "_0"
+                self._shape[o] = self._shape["_" + new_o]
+                self._dtype[o] = self._dtype["_" + new_o]
+        if op_name.lower() == "dropout":
+            if len(output) == 1:
+                return outputs
+            # TODO(zhreshold): support dropout mask? `onnx.py`
+            outputs = outputs[:-1]
+
+        return outputs
+
+
     def from_oneflow(self, nodes, model_dir_path, freeze_params=True, user_input=None):
-        """
+        """TODO: need modify
         Parameters
         ----------
         nodes : dict, keys: node.name, value: node
@@ -1424,6 +1459,7 @@ class OneflowGraph(object):
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
                 # print(op_name, op_attr)
+                # print()
 
                 self._parse_input(
                     node,
@@ -1432,27 +1468,30 @@ class OneflowGraph(object):
 
                 node_inputs = oneflow_input()
                 for input_name in node.user_conf.input:
-                    node_input_name = os.path.join(node_name, input_name)
                     node_input_paths = getattr(node.user_conf.input[input_name], 's')
                     for i in node_input_paths:
-                        node_input_path = os.path.join(model_dir_path, i)
-                        node_name_ = node_input_name + node_input_path
-                        node_inputs[node_name_] = self._nodes[node_name_]
+                        node_input = i.split("/")[0]
+                        node_inputs[node_input] = self._nodes[node_input]
+                
+                # for k in node_inputs:
+                #     print(k)
 
                 node_outputs = []
                 for output_name in node.user_conf.output:
-                    node_output_name = os.path.join(node_name, output_name)
                     node_output_paths = getattr(node.user_conf.output[output_name], 's')
                     for i in node_output_paths:
-                        node_output_path = os.path.join(model_dir_path, i)
+                        node_output_path = os.path.join(
+                            model_dir_path, i.replace("m.", "")
+                        )
                         if node_output_path in self._input_path_2_name:
                             node_outputs.append(self._input_path_2_name[node_output_path])
                         elif node_output_path in self._output_path_2_name:
                             node_outputs.append(self._output_path_2_name[node_output_path])
                         else:
                             warnings.warn("{} is not in known path".format(node_output_path))
-
-                node_outputs = fix_outputs(op_name, node_outputs)
+                # print(node_outputs)
+                node_outputs = self._parse_output(op_name, node_outputs)
+                # print(node_outputs)
                 # print()
 
                 # convert
@@ -1471,6 +1510,9 @@ class OneflowGraph(object):
                     op = fold_constant(op)
                 else:
                     op = _expr.TupleWrapper(fold_constant(op.astuple()), len(op))
+
+                # print(op)
+                # print()
                 
                 op_temp = []
                 op_temp.append(op)
@@ -1486,11 +1528,10 @@ class OneflowGraph(object):
         for node_name in nodes:
             node = nodes[node_name]
             if is_output_op(node):
-                node_path = os.path.join(model_dir_path, getattr(node.return_conf, "in"))
-                node_name_ = node_name + node_path
-                if node_name_ in self._nodes:
-                    outputs.append(self._nodes[node_name_])
+                if node_name in self._nodes:
+                    outputs.append(self._nodes[node_name])
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
+        # print(outputs)
 
         # step 5: get the relay IR
         free_vars = analysis.free_vars(outputs)
@@ -1583,10 +1624,13 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
         for i in data:
             attrs = i.group().split(":")
             data_size = tuple(map(int, re.findall(p1, attrs[2])[0][1:-1].split(", ")))
-            if t == "INPUT" or t == "OUTPUT":
-                shape[attrs[1][1:]] = data_size
-            else:
-                shape[attrs[1]] = data_size
+            # if t == "OUTPUT":
+            #     node_name = attrs[1]
+            # else:
+            node_name = attrs[1]
+            shape[node_name] = data_size
+            # TODO: dtype
+            dtype[node_name] = FLOW_2_STR_DTYPE[2]
 
     # get graph proto, if you don't _compile the graph, the _graph_proto will be None
     graph_input = re.search("INPUT:.*", graph_str).group().split(":")
@@ -1595,21 +1639,17 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
         _ = graph._compile(np.random.rand(shape_input))
     graph_proto = graph._graph_proto
 
-    # get nodes
-    for node in graph_proto.net.op:
-        nodes[op.name] = node
+    # get ops
+    for op in graph_proto.net.op:
+        nodes[op.name] = op
 
-    # get model params
-    model_array = {}
-    for param in graph._variable_conf:
-        model_array[graph._variables_conf[param].name] = param.numpy()
-
-    g = OneflowGraph(shape, dtype, nodes, model_array, model_dir_path)
+    g = OneflowGraph(shape, dtype, nodes, model_dir_path)
 
     # Use the graph proto as a scope so that ops can access other nodes if needed.
     mod, params = g.from_oneflow(
             nodes=nodes, model_dir_path=model_dir_path, 
             freeze_params=freeze_params, user_input=user_input
         )
+    print(mod)
 
     return mod, params
