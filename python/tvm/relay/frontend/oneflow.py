@@ -277,6 +277,22 @@ class Pool(OneFlowOpConverter):
         return out
 
 
+class AdaptiveAvgPool2d(OneFlowOpConverter):
+    """Operator converter for AdaptiveAvgPool2d"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        return _op.nn.adaptive_avg_pool2d(inputs[0], output_size=attrs["output_size"])
+
+
+class AdaptiveMaxPool2d(OneFlowOpConverter):
+    """Operator converter for AdaptiveMaxPool2d"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        return _op.nn.adaptive_max_pool2d(inputs[0], output_size=attrs["output_size"])
+
+
 class GlobalAveragePool(OneFlowOpConverter):
     """Operator converter for GlobalAveragePool"""
 
@@ -676,7 +692,7 @@ class Add(OneFlowOpConverter):
         assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
         axis = int(attrs.get("axis", 0))
 
-        true_names = ["weight"]
+        true_names = ["weight", "bias"]
         false_names = ["0-input_0"]
 
         for i in inputs:
@@ -731,8 +747,6 @@ class BroadcastMath(OneFlowOpConverter):
             else:
                 input_a = i
 
-        # Notes: in some ops: layer norm、div、...
-        # the input_a and input_b are all from Input_0
         # TODO: no info, can't do this
         if cls.name == "divide":
             length = []
@@ -752,18 +766,9 @@ class BroadcastMath(OneFlowOpConverter):
                     input_b = i
                 else:
                     input_a = i
-            # print(input_a)
-            # print()
-            # print(input_b)
-            # print()
         try:
             return get_relay_op(cls.name)(input_a, input_b)
         except UnboundLocalError:
-            # print(cls.name)
-            # for i in inputs:
-            #     print(i)
-            #     print()
-            # print()
             return get_relay_op(cls.name)(*inputs)
 
 
@@ -994,6 +999,16 @@ class Selu(OneFlowOpConverter):
         )
 
 
+class HardTanh(OneFlowOpConverter):
+    """Operator converter for HardTanh"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        tanh_min = attrs.get("min_val", 0.0)
+        tanh_max = attrs.get("max_val", 0.0)
+        return _op.tensor.clip(inputs[0], tanh_min, tanh_max)
+
+
 class Concat(OneFlowOpConverter):
     """Operator converter for Concat"""
 
@@ -1141,12 +1156,15 @@ def get_convert_map():
         "square": Square.get_converter(),
         # defs/activation
         "sigmoid": Renamer("sigmoid"),
+        "hardtanh": HardTanh.get_converter(),
         "relu": Renamer("relu"),
         "prelu": PReLU.get_converter(),
         # defs/nn
         "conv2d": Conv2d.get_converter(),
         "maxpool_2d": MaxPool2d.get_converter(),
         "avgpool_2d": AveragePool2d.get_converter(),
+        "adaptive_avg_pool2d": AdaptiveAvgPool2d.get_converter(),
+        "adaptive_max_pool2d": AdaptiveMaxPool2d.get_converter(),
         "dropout": Dropout.get_converter(),
         "normalization": BatchNorm.get_converter(),
         # defs/tensor
@@ -1234,11 +1252,11 @@ class OneflowGraph(object):
     dtype : dict of str to str
         The input types to the graph
     
-    节点唯一标识举例:
-    1. 模型参数param: m.layer4.1.bn1.weight
-    2. 模型buffer: m.layer4.1.bn1.running_mean
-    3. 节点输入: m.layer4.1.bn1-input_0
-    4. 节点输出: m.layer4.1.bn1-output_0
+    node name:
+    1. param: m.layer4.1.bn1.weight / ...
+    2. buffer: m.layer4.1.bn1.running_mean / ...
+    3. node inputs: m.layer4.1.bn1-input_0
+    4. node outputs: m.layer4.1.bn1-output_0
     """
     def __init__(self, shape, dtype, nodes, model_dir_path) -> None:
         self._nodes = {}
@@ -1277,9 +1295,9 @@ class OneflowGraph(object):
         The names of node_outputs do not appear directly in node.user_conf.input, 
         so the connection between layers will be cut off when building the graph
         steps:
-        1. find out the path of node_outputs
-        2. match paths and node.user_conf.input one by one
-        3. If two nodes have the same path, then both correspond to the same op
+        1. find out the names of node_outputs
+        2. match names and node.user_conf.input, see the self._parse_output
+        3. If two nodes have the same name after parsing, then both correspond to the same op
         """
         for node_name in nodes:
             node = nodes[node_name]
@@ -1287,7 +1305,6 @@ class OneflowGraph(object):
                 for input_name in node.user_conf.input:
                     node_input_paths = getattr(node.user_conf.input[input_name], 's')
                     for node_input_path in node_input_paths:
-                        # TODO: how to remove the "m." quickly
                         node_path = os.path.join(model_dir_path, node_input_path.replace("m.", ""))
                         node_input_name = node_input_path.split("/")[0]
                         self._input_path_2_name[node_path] = node_input_name
@@ -1341,10 +1358,16 @@ class OneflowGraph(object):
 
 
     def _parse_output(self, op_name, outputs):
+        """
+        e.g.: 
+        o: m.classifier.1-output_xxx
+        new_o: m.classifier.1-conv2d_0
+        "_"+new_o is in self._shape
+        """
         for o in outputs:
             if "0-output_0" not in o:
                 new_o = o.replace("-"+op_name, "-output")
-                new_o = new_o.split("_")[0] + "_0"
+                new_o = new_o.replace(new_o.split("_")[-1], "0")
                 self._shape[o] = self._shape["_" + new_o]
                 self._dtype[o] = self._dtype["_" + new_o]
         if op_name.lower() == "dropout":
@@ -1357,7 +1380,7 @@ class OneflowGraph(object):
 
 
     def from_oneflow(self, nodes, model_dir_path, freeze_params=True, user_input=None):
-        """TODO: need modify
+        """
         Parameters
         ----------
         nodes : dict, keys: node.name, value: node
@@ -1368,17 +1391,17 @@ class OneflowGraph(object):
             If freeze_params is True, 
             the computational graph input is the input of the first layer of the network, 
             which cannot be specified by the user, e.g.
-            Default input is: %conv1-in: Tensor[(100, 1, 28, 28), float32]
-            User-defined input is: %Input_0: Tensor[(1, 1, 28, 28), float32]
+            Default input is: %v_ResNetGraph_0-input_0: Tensor[(1, 3, 224, 224), float32]
+            User-defined input is: %_0-input_0: Tensor[(1, 3, 640, 480), float32]
             If freeze_params is on, then conv1-in will be the graph input, not Input_0
         user_input: dict
             User-defined input information for the graph
             {
                 node1_name: 
                 {
-                    'name':  node1_name,   # str, like "%MobilenetV2-Conv/in./mode_dir_path/Input_0/out"
+                    'name':  node1_name,   # str, like "%v_ResNetGraph_0-input_0"
                     'shape': node1_shape,  # tuple
-                    'dtype': node1_dtype   # str, like "float16"
+                    'dtype': node1_dtype   # str, like "float32"
                 }
                 ...
             }
@@ -1395,8 +1418,8 @@ class OneflowGraph(object):
         # step 1: get the graph input
         if not freeze_params:
             for node_init_name in user_input:
-                if "Input_0" not in node_init_name:
-                    raise KeyError("user_input['name'] should contain 'Input_0' to let program know that this is input node")
+                if "0-input_0" not in node_init_name:
+                    raise KeyError("user_input['name'] should contain '0-input_0' to let program know that this is input node")
                 else:
                     self._nodes[node_init_name] = new_var(
                         node_init_name,
@@ -1434,8 +1457,7 @@ class OneflowGraph(object):
 
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
-                print(op_name, op_attr)
-                # print()
+                # print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -1487,8 +1509,8 @@ class OneflowGraph(object):
                 else:
                     op = _expr.TupleWrapper(fold_constant(op.astuple()), len(op))
 
-                print(infer_shape(op))
-                print()
+                # print(infer_shape(op))
+                # print()
                 
                 op_temp = []
                 op_temp.append(op)
@@ -1507,7 +1529,6 @@ class OneflowGraph(object):
                 if node_name in self._nodes:
                     outputs.append(self._nodes[node_name])
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
-        # print(outputs)
 
         # step 5: get the relay IR
         free_vars = analysis.free_vars(outputs)
@@ -1626,6 +1647,5 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
             nodes=nodes, model_dir_path=model_dir_path, 
             freeze_params=freeze_params, user_input=user_input
         )
-    # print(mod)
 
     return mod, params
