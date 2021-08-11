@@ -596,6 +596,12 @@ class Flatten(OneFlowOpConverter):
         return out
 
 
+class Transpose(OneFlowOpConverter):
+    """Operator converter for Transpose"""
+
+    # TODO: for yolo
+
+
 class MatMul(OneFlowOpConverter):
     """Operator converter for MatMul"""
 
@@ -633,6 +639,83 @@ class MatMul(OneFlowOpConverter):
             matmul_a *= _expr.const(alpha, dtype=dtype)
 
         return _op.nn.dense(matmul_a, matmul_b, units=channels)
+
+    
+class Upsample(OneFlowOpConverter):
+    """Operator converter for Upsample (nearest mode)"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        scales = attrs.get("scales")
+
+        input_shape = infer_shape(inputs[0])
+        dims = len(input_shape)
+
+        if not scales:
+            # Here we are going to higher OPSET version.
+            assert len(inputs) == 2, "Upsample op takes 2 inputs, {} given".format(len(inputs))
+
+            if get_name(inputs[1]) in params:
+                scales = params[inputs[1].name_hint].numpy()
+            else:
+                scales = inputs[1]
+        if isinstance(scales, _expr.Constant):
+            scales = list(scales.data.numpy())
+        if not isinstance(scales, _expr.Expr):
+            assert scales[0] == 1.0 and scales[1] == 1.0
+
+        mode = attrs.get("mode")
+        if mode == b"nearest":
+            method = "nearest_neighbor"
+        elif mode == b"linear":
+            method = "trilinear" if dims == 5 else "bilinear"
+        else:
+            raise tvm.error.OpAttributeInvalid(
+                'Value {} in attribute "mode" of operator Upsample is not valid.'.format(mode)
+            )
+
+        # in 3d case, we use the purely static op
+        if dims == 5:
+            if isinstance(scales, _expr.Expr):
+                scale_h = _op.take(scales, _op.const(3))
+                scale_w = _op.take(scales, _op.const(4))
+                scale_d = _op.take(scales, _op.const(1))
+            else:
+                assert len(scales) == 5
+                scale_h = scales[-2]
+                scale_w = scales[-1]
+                scale_d = scales[-3]
+
+            layout = "NCDHW"
+            out = _op.nn.upsampling3d(
+                inputs[0],
+                scale_d,
+                scale_h,
+                scale_w,
+                layout=layout,
+                method=method,
+                coordinate_transformation_mode="asymmetric",
+            )
+        # in 2d case, use dynamic op
+        else:
+            if isinstance(scales, _expr.Expr):
+                scale_h = _op.take(scales, _op.const(3))
+                scale_w = _op.take(scales, _op.const(4))
+            else:
+                assert len(scales) == 4
+                scale_h = scales[-2]
+                scale_w = scales[-1]
+            layout = "NCHW"
+
+            out = _op.nn.upsampling(
+                inputs[0],
+                scale_h,
+                scale_w,
+                layout=layout,
+                method=method,
+                align_corners=False,
+            )
+        return out
 
 
 class Reduce(OneFlowOpConverter):
@@ -1173,9 +1256,11 @@ def get_convert_map():
         "clip_by_scalar": Clip.get_converter(),
         "slice": Slice.get_converter(),
         "expand": Expand.get_converter(),
+        "transpose": AttrCvt("transpose", {"perm": "axes"}),
         # defs/others
         "reshape": Reshape.get_converter(),
         "flatten": Flatten.get_converter(),
+        "upsample_nearest_2d": Upsample.get_converter(),
     }
 
 
