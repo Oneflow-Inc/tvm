@@ -149,6 +149,19 @@ def dimension_constraint():
     return _dim_check, "Only 1d, 2d and 3d kernel supported."
 
 
+def get_pad_pair(input1d, kernel1d, stride1d, mode):
+    """infer pad size"""
+    if input1d % stride1d == 0:
+        pad = max(kernel1d - stride1d, 0)
+    else:
+        pad = max(kernel1d - (input1d % stride1d), 0)
+    pad_before = pad // 2
+    pad_after = pad - pad_before
+    if "LOWER" in mode:
+        return [pad_after, pad_before]
+    return [pad_before, pad_after]
+
+
 def autopad(
     data,
     strides,
@@ -239,7 +252,6 @@ class OneFlowOpConverter:
 
 class Pool(OneFlowOpConverter):
     """A helper class for pool op converters."""
-    # TODO: need more test
     name = ""
 
     @classmethod
@@ -249,22 +261,16 @@ class Pool(OneFlowOpConverter):
         input_dtype = infer_type(data).checked_type.dtype
         ndim = len(input_shape)
 
-        if attrs["data_format"] == "channels_first":
-            attrs["layout"] = "NCHW"
-        elif attrs["data_format"] == "channels_last":
-            attrs["layout"] = "NHWC"
-        else:
-            msg = 'Value {} of attribute "data_format" of operator Pooling ' "is not valid."
-            raise tvm.error.OpAttributeInvalid(msg.format(attrs["data_format"]))
         attrs.pop("data_format")
 
         out = AttrCvt(
             op_name=cls.name,
             transforms={
                 "kernel_size": "pool_size",
+                "stride": "strides",
                 "dilations": ("dilation", 1),
             },
-            ignores=["return_indices", "stride", "divisor_override"],
+            ignores=["return_indices", "divisor_override"],
             custom_check=dimension_constraint(),
         )([data], attrs, params)
 
@@ -313,9 +319,8 @@ class Conv(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        # TODO: there are key "weight" and "in" in op
-        # The kernel is imported from model_dir_path, without the "out_0" logo, etc.
-        # The data is obtained through the graph, its op contains "Input_0"
+        # The kernel is imported from model_dir_path, without the ".weight" logo, etc.
+        # The data is obtained through the graph, its op contains "0-input_0"
         in_names = ["0-input_0"]
         kernel_names = [".weight"]
         for i in inputs:
@@ -378,8 +383,8 @@ class ConvTranspose(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        in_names = ["Input_0"]
-        kernel_names = ["/weight", "out_0", "/in"]
+        in_names = ["0-input_0"]
+        kernel_names = [".weight"]
         for i in inputs:
             IN_NAMES = any(x in str(i) for x in in_names)
             KERNEL_NAMES = any(x in str(i) for x in kernel_names)
@@ -429,8 +434,8 @@ class Upsample(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        in_names = ["Input_0"]
-        kernel_names = ["/weight", "out_0", "/in"]
+        in_names = ["0-input_0"]
+        kernel_names = [".weight"]
         for i in inputs:
             IN_NAMES = any(x in str(i) for x in in_names)
             KERNEL_NAMES = any(x in str(i) for x in kernel_names)
@@ -671,8 +676,8 @@ class Add(OneFlowOpConverter):
         assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
         axis = int(attrs.get("axis", 0))
 
-        true_names = ["/b"]
-        false_names = ["/in", "out_0", "Input_0"]
+        true_names = ["weight"]
+        false_names = ["0-input_0"]
 
         for i in inputs:
             T_NAMES = any(x in str(i) for x in true_names)
@@ -717,11 +722,11 @@ class BroadcastMath(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
-        beta_names = ["/b", "beta", "gamma", "mean", "variance"]
+        beta_names = ["weight", "bias", "mean", "var"]
 
         for i in inputs:
             T_NAMES = any([x in str(i) for x in beta_names])
-            if T_NAMES and "Input_0" not in str(i):
+            if T_NAMES and "0-input_0" not in str(i):
                 input_b = i
             else:
                 input_a = i
@@ -1228,6 +1233,12 @@ class OneflowGraph(object):
         The input shape to the graph
     dtype : dict of str to str
         The input types to the graph
+    
+    节点唯一标识举例:
+    1. 模型参数param: m.layer4.1.bn1.weight
+    2. 模型buffer: m.layer4.1.bn1.running_mean
+    3. 节点输入: m.layer4.1.bn1-input_0
+    4. 节点输出: m.layer4.1.bn1-output_0
     """
     def __init__(self, shape, dtype, nodes, model_dir_path) -> None:
         self._nodes = {}
@@ -1262,22 +1273,6 @@ class OneflowGraph(object):
                 layer_node['params'] = array.reshape(shape)
             self._model_array[layer_name] = layer_node
 
-        # 所有模型参数都在这里面了
-        # for k in self._model_array:
-            # print(k, self._model_array[k]['params'].shape)
-
-        # 所有节点的都在这里面了，包括保存的参数与中间变量
-        # for k in self._shape:
-        #     print(k, self._shape[k])
-        """
-        key分为
-        1. 模型参数param: m.layer4.1.bn1.weight
-        2. 模型buffer: m.layer4.1.bn1.running_mean
-        3. 节点输入: m.layer4.1.bn1-input_0
-        4. 节点输出: m.layer4.1.bn1-output_0
-        这些作为节点的唯一标识
-        """
-
         """
         The names of node_outputs do not appear directly in node.user_conf.input, 
         so the connection between layers will be cut off when building the graph
@@ -1294,16 +1289,6 @@ class OneflowGraph(object):
                     for node_input_path in node_input_paths:
                         # TODO: how to remove the "m." quickly
                         node_path = os.path.join(model_dir_path, node_input_path.replace("m.", ""))
-                        # # make sure the values of self._input_path_2_name is list
-                        # names_temp = []
-                        # names_temp.append(node_name_)
-                        # if node_input_path in self._input_path_2_name:
-                        #     names_b = self._input_path_2_name[node_input_path]
-                        #     while isinstance(names_b, list):
-                        #         names_temp.append(names_b[0])
-                        #         names_b = names_b[1:]
-                        #         if names_b == []:
-                        #             break
                         node_input_name = node_input_path.split("/")[0]
                         self._input_path_2_name[node_path] = node_input_name
                         for param_name in self._model_array:
@@ -1324,15 +1309,6 @@ class OneflowGraph(object):
                     getattr(node.output_conf, "in").replace("m.", "")
                 )
                 self._output_path_2_name[output_path] = node_name
-        
-        # for k in self._input_path_2_name:
-            # print(k)
-        for k in self._output_path_2_name:
-            print(k, self._output_path_2_name[k])
-        # for k in self._shape:
-        #     print(k)
-        # for k in self._nodes:
-        #     print(k)
 
 
     def _parse_input(self, node, model_dir_path):
@@ -1458,7 +1434,7 @@ class OneflowGraph(object):
 
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
-                # print(op_name, op_attr)
+                print(op_name, op_attr)
                 # print()
 
                 self._parse_input(
@@ -1511,8 +1487,8 @@ class OneflowGraph(object):
                 else:
                     op = _expr.TupleWrapper(fold_constant(op.astuple()), len(op))
 
-                # print(op)
-                # print()
+                print(infer_shape(op))
+                print()
                 
                 op_temp = []
                 op_temp.append(op)
@@ -1650,6 +1626,6 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
             nodes=nodes, model_dir_path=model_dir_path, 
             freeze_params=freeze_params, user_input=user_input
         )
-    print(mod)
+    # print(mod)
 
     return mod, params
