@@ -6,18 +6,13 @@ import warnings
 import numpy as np
 import tvm
 from tvm.ir import IRModule
-from tvm.relay.analysis.analysis import check_basic_block_normal_form
 from tvm.topi.utils import get_const_tuple
 
-from ... import nd as _nd
 from .. import analysis
 from .. import expr as _expr
 from .. import function as _function
-from .. import loops as _loops
 from .. import op as _op
-from .. import qnn as _qnn
 from .. import ty as _ty
-from .. import vision as _vision
 from .common import (
     AttrCvt,
     Renamer,
@@ -94,7 +89,6 @@ def get_node_info(node):
 
 def parse_attr(attr):
     # Parse node_attr
-    # TODO(hujiakui): may have missed
     attrs = {}
     for a in attr:
         attr_str = str(attr[a])
@@ -147,85 +141,6 @@ def dimension_constraint():
         return False
 
     return _dim_check, "Only 1d, 2d and 3d kernel supported."
-
-
-def get_pad_pair(input1d, kernel1d, stride1d, mode):
-    """infer pad size"""
-    if input1d % stride1d == 0:
-        pad = max(kernel1d - stride1d, 0)
-    else:
-        pad = max(kernel1d - (input1d % stride1d), 0)
-    pad_before = pad // 2
-    pad_after = pad - pad_before
-    if "LOWER" in mode:
-        return [pad_after, pad_before]
-    return [pad_before, pad_after]
-
-
-def autopad(
-    data,
-    strides,
-    kernel_shape,
-    dilations,
-    ndim,
-    pad_type="constant",
-    deconv=False,
-    mode="SAME_UPPER",
-    pad_value=0.0,
-):
-    """
-    Perform autopadding with dynamic input shapes
-    """
-    mode = mode.upper()
-
-    # get attributes as constants
-    strides = _op.const(np.array(strides), dtype="int64")
-    dilated_kernel_shape = _op.const(
-        np.array(
-            [(kernel - 1) * dilation + 1 for kernel, dilation in zip(kernel_shape, dilations)]
-        ),
-        dtype="int64",
-    )
-
-    # get input shape
-    shape = _op.strided_slice(shape_of(data, dtype="int64"), [2], [ndim])
-
-    # set up integer constants
-    zero = _op.const(0, dtype="int64")
-    one = _op.const(1, dtype="int64")
-    two = _op.const(2, dtype="int64")
-
-    # Calculate total padding
-    mod = _op.mod(shape, strides)
-
-    left = _op.maximum(dilated_kernel_shape - strides, zero)
-    right = _op.maximum(dilated_kernel_shape - mod, zero)
-
-    total_pad = _op.where(_op.equal(mod, zero), left, right)
-    if deconv:
-        total_pad = _op.const(np.array(kernel_shape), dtype="int64") - one - total_pad
-
-    # split total padding into before and after
-    pad_before = _op.floor_divide(total_pad, two)
-    pad_after = total_pad - pad_before
-
-    # combine
-    if "LOWER" in mode:
-        pad = _op.concatenate(
-            [_op.reshape(pad_after, [-1, 1]), _op.reshape(pad_before, [-1, 1])], axis=1
-        )
-    else:
-        pad = _op.concatenate(
-            [_op.reshape(pad_before, [-1, 1]), _op.reshape(pad_after, [-1, 1])], axis=1
-        )
-
-    # pad N and C with zeros
-    pad = _op.concatenate([_op.const(np.zeros([2, 2], dtype="int64"), dtype="int64"), pad], axis=0)
-
-    if isinstance(pad_value, (float, int)):
-        pad_value = _op.const(pad_value)
-
-    return _op.nn.pad(data, fold_constant(pad), pad_value, pad_type)
 
 
 class OneFlowOpConverter:
@@ -464,29 +379,8 @@ class Upsample(OneFlowOpConverter):
         input_shape = infer_shape(data)
         dims = len(input_shape)
 
-        scales = attrs.get("scales")
-        if not scales:
-            # Here we are going to higher OPSET version.
-            assert len(inputs) == 2, "Upsample op takes 2 inputs, {} given".format(len(inputs))
-
-            if get_name(kernel) in params:
-                scales = params[kernel.name_hint].numpy()
-            else:
-                scales = kernel
-        if isinstance(scales, _expr.Constant):
-            scales = list(scales.data.numpy())
-        if not isinstance(scales, _expr.Expr):
-            assert scales[0] == 1.0 and scales[1] == 1.0
-
-        mode = attrs.get("mode")
-        if mode == "nearest":
-            method = "nearest_neighbor"
-        elif mode == "linear":
-            method = "trilinear" if dims == 5 else "bilinear"
-        else:
-            raise tvm.error.OpAttributeInvalid(
-                'Value {} in attribute "mode" of operator Upsample is not valid.'.format(mode)
-            )
+        width_scale = attrs.get("width_scale", 1.0)
+        height_scale = attrs.get("height_scale", 1.0)
 
         # in 3d case, we use the purely static op
         if dims == 5:
@@ -512,21 +406,16 @@ class Upsample(OneFlowOpConverter):
             )
         # in 2d case, use dynamic op
         else:
-            if isinstance(scales, _expr.Expr):
-                scale_h = _op.take(scales, _op.const(3))
-                scale_w = _op.take(scales, _op.const(4))
-            else:
-                assert len(scales) == 4
-                scale_h = scales[-2]
-                scale_w = scales[-1]
+            if isinstance(height_scale, _expr.Expr):
+                height_scale = _op.take(height_scale, _op.const(3))
+                width_scale = _op.take(width_scale, _op.const(4))
             layout = "NCHW"
 
             out = _op.nn.upsampling(
                 inputs[0],
-                scale_h,
-                scale_w,
+                height_scale,
+                width_scale,
                 layout=layout,
-                method=method,
                 align_corners=False,
             )
         return out
@@ -596,12 +485,6 @@ class Flatten(OneFlowOpConverter):
         return out
 
 
-class Transpose(OneFlowOpConverter):
-    """Operator converter for Transpose"""
-
-    # TODO: for yolo
-
-
 class MatMul(OneFlowOpConverter):
     """Operator converter for MatMul"""
 
@@ -639,83 +522,6 @@ class MatMul(OneFlowOpConverter):
             matmul_a *= _expr.const(alpha, dtype=dtype)
 
         return _op.nn.dense(matmul_a, matmul_b, units=channels)
-
-    
-class Upsample(OneFlowOpConverter):
-    """Operator converter for Upsample (nearest mode)"""
-
-    @classmethod
-    def _impl_v1(cls, inputs, attrs, params):
-        scales = attrs.get("scales")
-
-        input_shape = infer_shape(inputs[0])
-        dims = len(input_shape)
-
-        if not scales:
-            # Here we are going to higher OPSET version.
-            assert len(inputs) == 2, "Upsample op takes 2 inputs, {} given".format(len(inputs))
-
-            if get_name(inputs[1]) in params:
-                scales = params[inputs[1].name_hint].numpy()
-            else:
-                scales = inputs[1]
-        if isinstance(scales, _expr.Constant):
-            scales = list(scales.data.numpy())
-        if not isinstance(scales, _expr.Expr):
-            assert scales[0] == 1.0 and scales[1] == 1.0
-
-        mode = attrs.get("mode")
-        if mode == b"nearest":
-            method = "nearest_neighbor"
-        elif mode == b"linear":
-            method = "trilinear" if dims == 5 else "bilinear"
-        else:
-            raise tvm.error.OpAttributeInvalid(
-                'Value {} in attribute "mode" of operator Upsample is not valid.'.format(mode)
-            )
-
-        # in 3d case, we use the purely static op
-        if dims == 5:
-            if isinstance(scales, _expr.Expr):
-                scale_h = _op.take(scales, _op.const(3))
-                scale_w = _op.take(scales, _op.const(4))
-                scale_d = _op.take(scales, _op.const(1))
-            else:
-                assert len(scales) == 5
-                scale_h = scales[-2]
-                scale_w = scales[-1]
-                scale_d = scales[-3]
-
-            layout = "NCDHW"
-            out = _op.nn.upsampling3d(
-                inputs[0],
-                scale_d,
-                scale_h,
-                scale_w,
-                layout=layout,
-                method=method,
-                coordinate_transformation_mode="asymmetric",
-            )
-        # in 2d case, use dynamic op
-        else:
-            if isinstance(scales, _expr.Expr):
-                scale_h = _op.take(scales, _op.const(3))
-                scale_w = _op.take(scales, _op.const(4))
-            else:
-                assert len(scales) == 4
-                scale_h = scales[-2]
-                scale_w = scales[-1]
-            layout = "NCHW"
-
-            out = _op.nn.upsampling(
-                inputs[0],
-                scale_h,
-                scale_w,
-                layout=layout,
-                method=method,
-                align_corners=False,
-            )
-        return out
 
 
 class Reduce(OneFlowOpConverter):
@@ -830,7 +636,7 @@ class BroadcastMath(OneFlowOpConverter):
             else:
                 input_a = i
 
-        # TODO: no info, can't do this
+        # TODO(hujiakui): no info about which is a
         if cls.name == "divide":
             length = []
             for i in inputs:
@@ -1055,7 +861,7 @@ class PReLU(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "PReLU need 2 inputs, but {} given".format(len(inputs))
         for i in inputs:
-            if "Input_0" in str(i):
+            if "0-input_0" in str(i):
                 prelu_a = i
             else:
                 prelu_b = i
@@ -1159,7 +965,7 @@ class Scatter(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        # TODO(jkhu29): sort the inputs
+        # TODO(hujiakui): sort the inputs
         axis = attrs.get("axis", 0)
         return _op.scatter(inputs[0], inputs[1], inputs[2], axis)
 
@@ -1172,6 +978,13 @@ class Unsqueeze(OneFlowOpConverter):
         axes = sorted(attrs["axes"])
         for axis in axes:
             inputs[0] = _op.expand_dims(inputs[0], axis=axis, num_newaxis=1)
+        return inputs[0]
+
+
+class Sigmoid(OneFlowOpConverter):
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
         return inputs[0]
 
 
@@ -1241,6 +1054,7 @@ def get_convert_map():
         "sigmoid": Renamer("sigmoid"),
         "hardtanh": HardTanh.get_converter(),
         "relu": Renamer("relu"),
+        "leaky_relu": Renamer("leaky_relu"),
         "prelu": PReLU.get_converter(),
         # defs/nn
         "conv2d": Conv2d.get_converter(),
@@ -1257,10 +1071,12 @@ def get_convert_map():
         "slice": Slice.get_converter(),
         "expand": Expand.get_converter(),
         "transpose": AttrCvt("transpose", {"perm": "axes"}),
+        "expand_dims": Expand.get_converter(),
         # defs/others
         "reshape": Reshape.get_converter(),
         "flatten": Flatten.get_converter(),
         "upsample_nearest_2d": Upsample.get_converter(),
+        "sigmoid_v2": Sigmoid.get_converter(),
     }
 
 
@@ -1452,13 +1268,13 @@ class OneflowGraph(object):
         for o in outputs:
             if "0-output_0" not in o:
                 new_o = o.replace("-"+op_name, "-output")
-                new_o = new_o.replace(new_o.split("_")[-1], "0")
+                new_o = new_o.replace("_"+new_o.split("_")[-1], "_0")
                 self._shape[o] = self._shape["_" + new_o]
                 self._dtype[o] = self._dtype["_" + new_o]
         if op_name.lower() == "dropout":
             if len(output) == 1:
                 return outputs
-            # TODO(zhreshold): support dropout mask? `onnx.py`
+            # TODO(zhreshold): support dropout mask? `form onnx.py`
             outputs = outputs[:-1]
 
         return outputs
@@ -1542,7 +1358,6 @@ class OneflowGraph(object):
 
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
-                # print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -1555,9 +1370,6 @@ class OneflowGraph(object):
                     for i in node_input_paths:
                         node_input = i.split("/")[0]
                         node_inputs[node_input] = self._nodes[node_input]
-                
-                # for k in node_inputs:
-                #     print(k)
 
                 node_outputs = []
                 for output_name in node.user_conf.output:
@@ -1570,12 +1382,7 @@ class OneflowGraph(object):
                             node_outputs.append(self._input_path_2_name[node_output_path])
                         elif node_output_path in self._output_path_2_name:
                             node_outputs.append(self._output_path_2_name[node_output_path])
-                        else:
-                            warnings.warn("{} is not in known path".format(node_output_path))
-                # print(node_outputs)
                 node_outputs = self._parse_output(op_name, node_outputs)
-                # print(node_outputs)
-                # print()
 
                 # convert
                 op = self._convert_operator(op_name, node_inputs, op_attr)
@@ -1593,9 +1400,6 @@ class OneflowGraph(object):
                     op = fold_constant(op)
                 else:
                     op = _expr.TupleWrapper(fold_constant(op.astuple()), len(op))
-
-                # print(infer_shape(op))
-                # print()
                 
                 op_temp = []
                 op_temp.append(op)
@@ -1692,13 +1496,17 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
     if freeze_params and user_input is not None:
         warnings.warn("'user_input' will not work, please check the 'freeze_params'")
 
-    # get all nodes
-    nodes = {}
+    # get info of nodes
     shape = {}
     dtype = {}
-
-    # get info of nodes
     graph_str = repr(graph)
+    DTYPE = 2
+    # TODO(hujiakui): prepare for float16 and int8
+    # if "float16" in graph_str:
+    #     DTYPE = 9
+    # elif "int8" in graph_str:
+    #     DTYPE = 4
+
     p1 = re.compile("\[.*?\]", re.S)
     types = ["INPUT", "PARAMETER", "BUFFER", "OUTPUT"]
     for t in types:
@@ -1706,13 +1514,9 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
         for i in data:
             attrs = i.group().split(":")
             data_size = tuple(map(int, re.findall(p1, attrs[2])[0][1:-1].split(", ")))
-            # if t == "OUTPUT":
-            #     node_name = attrs[1]
-            # else:
             node_name = attrs[1]
             shape[node_name] = data_size
-            # TODO: dtype
-            dtype[node_name] = FLOW_2_STR_DTYPE[2]
+            dtype[node_name] = FLOW_2_STR_DTYPE[DTYPE]
 
     # get graph proto, if you don't _compile the graph, the _graph_proto will be None
     graph_input = re.search("INPUT:.*", graph_str).group().split(":")
@@ -1721,7 +1525,8 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
         _ = graph._compile(np.random.rand(shape_input))
     graph_proto = graph._graph_proto
 
-    # get ops
+    # get all nodes
+    nodes = {}
     for op in graph_proto.net.op:
         nodes[op.name] = op
 
