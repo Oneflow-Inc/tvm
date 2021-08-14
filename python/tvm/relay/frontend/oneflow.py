@@ -271,8 +271,8 @@ class Conv(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         # The kernel is imported from model_dir_path, without the ".weight" logo, etc.
-        # The data is obtained through the graph, its op contains "0-input_0"
-        in_names = ["0-input_0"]
+        # The data is obtained through the graph, its op contains "-input_0"
+        in_names = ["-input_0"]
         kernel_names = [".weight"]
         for i in inputs:
             IN_NAMES = any(x in str(i) for x in in_names)
@@ -334,7 +334,7 @@ class ConvTranspose(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        in_names = ["0-input_0"]
+        in_names = ["-input_0"]
         kernel_names = [".weight"]
         for i in inputs:
             IN_NAMES = any(x in str(i) for x in in_names)
@@ -369,23 +369,25 @@ class ConvTranspose(OneFlowOpConverter):
         attrs["padding"] = [pad_v[0], pad_v[1], pad_v[0], pad_v[1]]
 
         out = AttrCvt(
-            op_name=dimension_picker("conv", "_transpose"),
+            op_name="conv2d_transpose",
             transforms={
                 "group": ("groups", 1),
             },
-            disables=["output_shape", "filters", "padding_after", "padding_before"],
+            disables=["filters", "data_format", "padding_before"],
             custom_check=dimension_constraint(),
-        )([data, kernel], attr, params)
+        )([data, kernel], attrs, params)
 
         return out
 
 
 class Upsample(OneFlowOpConverter):
-    """Operator converter for Upsample (nearest mode)."""
+    """A helper class for upsample op converters"""
+
+    name = ""
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        in_names = ["0-input_0"]
+        in_names = ["-input_0"]
         kernel_names = [".weight"]
         for i in inputs:
             IN_NAMES = any(x in str(i) for x in in_names)
@@ -401,6 +403,14 @@ class Upsample(OneFlowOpConverter):
 
         width_scale = attrs.get("width_scale", 1.0)
         height_scale = attrs.get("height_scale", 1.0)
+        align_corners = attrs.get("align_corners", False)
+
+        if "nearest" in cls.name:
+            method = "nearest_neighbor"
+        elif "trilinear" in cls.name:
+            method = "trilinear"
+        elif "bilinear" in cls.name:
+            method = "bilinear"
 
         # in 3d case, we use the purely static op
         if dims == 5:
@@ -436,26 +446,39 @@ class Upsample(OneFlowOpConverter):
                 height_scale,
                 width_scale,
                 layout=layout,
-                align_corners=False,
+                method=method,
+                align_corners=align_corners,
             )
         return out
 
 
+class UpsampleNearest(Upsample):
+    """Operator converter for Upsample Nearest"""
+
+    name = "upsample_nearest"
+
+
+class UpsampleBiLinear(Upsample):
+    """Operator converter for Upsample Bilinear"""
+
+    name = "upsample_bilinear"
+
+
 class Conv2d(Conv):
-    """Operator converter for Conv2d."""
+    """Operator converter for Conv2d"""
 
     name = "conv2d"
 
 
 class BatchNorm(OneFlowOpConverter):
-    """Operator converter for BatchNorm."""
+    """Operator converter for BatchNorm"""
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         # sort the inputs
         sorted_inputs = copy.deepcopy(inputs)
         for i in inputs:
-            IN_NAMES = "0-input_0" in str(i)
+            IN_NAMES = "-input_0" in str(i)
             if IN_NAMES:
                 sorted_inputs[0] = i
             elif 'weight' in str(i) and not IN_NAMES:
@@ -511,7 +534,7 @@ class MatMul(OneFlowOpConverter):
         )
         # Similar to 'class Conv'
         true_names = ["weight"]
-        false_names = ["0-input_0"]
+        false_names = ["-input_0"]
         for i in inputs:
             T_NAMES = any(x in str(i) for x in true_names)
             F_NAMES = any(x in str(i) for x in false_names)
@@ -600,7 +623,7 @@ class Add(OneFlowOpConverter):
         axis = int(attrs.get("axis", 0))
 
         true_names = ["weight", "bias"]
-        false_names = ["0-input_0"]
+        false_names = ["-input_0"]
 
         for i in inputs:
             T_NAMES = any(x in str(i) for x in true_names)
@@ -649,7 +672,7 @@ class BroadcastMath(OneFlowOpConverter):
 
         for i in inputs:
             T_NAMES = any([x in str(i) for x in beta_names])
-            if T_NAMES and "0-input_0" not in str(i):
+            if T_NAMES and "-input_0" not in str(i):
                 input_b = i
             else:
                 input_a = i
@@ -883,7 +906,7 @@ class PReLU(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "PReLU need 2 inputs, but {} given".format(len(inputs))
         for i in inputs:
-            if "0-input_0" in str(i):
+            if "-input_0" in str(i):
                 prelu_a = i
             else:
                 prelu_b = i
@@ -1080,12 +1103,15 @@ def get_convert_map():
         "prelu": PReLU.get_converter(),
         # defs/nn
         "conv2d": Conv2d.get_converter(),
+        "deconv2d": ConvTranspose.get_converter(),
         "maxpool_2d": MaxPool2d.get_converter(),
         "avgpool_2d": AveragePool2d.get_converter(),
         "adaptive_avg_pool2d": AdaptiveAvgPool2d.get_converter(),
         "adaptive_max_pool2d": AdaptiveMaxPool2d.get_converter(),
         "dropout": Dropout.get_converter(),
         "normalization": BatchNorm.get_converter(),
+        "upsample_nearest_2d": UpsampleNearest.get_converter(),
+        "upsample_bilinear_2d": UpsampleBiLinear.get_converter(),
         # defs/tensor
         "matmul": MatMul.get_converter(),
         "concat": Concat.get_converter(),
@@ -1097,7 +1123,6 @@ def get_convert_map():
         # defs/others
         "reshape": Reshape.get_converter(),
         "flatten": Flatten.get_converter(),
-        "upsample_nearest_2d": Upsample.get_converter(),
         "sigmoid_v2": Sigmoid.get_converter(),
     }
 
@@ -1261,7 +1286,7 @@ class OneflowGraph(object):
                 node_path = os.path.join(model_dir_path, i.replace("m.", ""))
 
                 if node_input not in self._nodes:
-                    if node_path not in self._input_path_2_name or "0-input_0" in node_input:
+                    if node_path not in self._input_path_2_name or "-input_0" in node_input:
                         self._nodes[node_input] = new_var(
                             node_input,
                             shape=node_input_shape,
@@ -1288,7 +1313,7 @@ class OneflowGraph(object):
         "_"+new_o is in self._shape
         """
         for o in outputs:
-            if "0-output_0" not in o:
+            if "-output_0" not in o:
                 new_o = o.replace("-"+op_name, "-output")
                 new_o = new_o.replace("_"+new_o.split("_")[-1], "_0")
                 self._shape[o] = self._shape["_" + new_o]
@@ -1341,9 +1366,9 @@ class OneflowGraph(object):
         # step 1: get the graph input
         if not freeze_params:
             for node_init_name in user_input:
-                if "0-input_0" not in node_init_name:
+                if "-input_0" not in node_init_name:
                     raise KeyError(
-                        "user_input['name'] should contain '0-input_0' " +
+                        "user_input['name'] should contain '-input_0' " +
                         "to let program know that this is input node"
                     )
                 else:
@@ -1458,7 +1483,7 @@ class OneflowGraph(object):
 
         input_names = list(self._inputs.keys())
         for i in range(len(input_names)):
-            if i != 0 and 'Input_0' in input_names[i]:
+            if i != 0 and '-input_0' in input_names[i]:
                 str_buffer = copy.deepcopy(input_names[i])
                 del input_names[i]
                 input_names.insert(0, str_buffer)
