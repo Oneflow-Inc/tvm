@@ -1,4 +1,23 @@
-import os, sys
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# pylint: disable=invalid-name, import-self, len-as-condition, unused-argument, too-many-lines
+# pylint: disable=import-outside-toplevel
+"""OF: OneFlow frontend"""
+import os
 import re
 import copy
 import warnings
@@ -143,7 +162,7 @@ def dimension_constraint():
     return _dim_check, "Only 1d, 2d and 3d kernel supported."
 
 
-class OneFlowOpConverter:
+class OneFlowOpConverter(object):
     """A helper class for holding oneflow op converters."""
 
     @classmethod
@@ -152,7 +171,8 @@ class OneFlowOpConverter:
         Get converter matches given opset.
         Parameters
         ----------
-        
+        None
+
         Returns
         -------
         converter, which should be `_impl_vx`.
@@ -344,7 +364,7 @@ class ConvTranspose(OneFlowOpConverter):
         if "dilation_rate" in attrs:
             attrs["dilation"] = list(attrs["dilation_rate"])
             attrs.pop("dilation_rate")
-        
+
         pad_v = attrs.get("padding_before", [0, 0])
         attrs["padding"] = [pad_v[0], pad_v[1], pad_v[0], pad_v[1]]
 
@@ -453,17 +473,13 @@ class BatchNorm(OneFlowOpConverter):
                 attrs["axis"] = 1
 
         out = AttrCvt(
-            op_name="batch_norm", 
+            op_name="batch_norm",
             ignores=["training"],
             disables=["momentum"]
         )(sorted_inputs, attrs, params)
         return out[0]
 
 
-class LayerNorm(OneFlowOpConverter):
-    """Operator converter for LayerNorm"""
-
-    
 class Flatten(OneFlowOpConverter):
     """Operator converter for Flatten"""
 
@@ -532,7 +548,7 @@ class Reduce(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         attr = {
-            "axis": attrs.get("axes", 0), 
+            "axis": attrs.get("axes", 0),
             "keepdims": attrs.get("keepdims", True)
             }
         return AttrCvt(cls.name)(inputs, attr)
@@ -567,7 +583,9 @@ class Square(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 1, "Square op {} take 1 inputs, {} given".format(cls.name, len(inputs))
+        assert len(inputs) == 1, "Square op {} take 1 inputs, {} given".format(
+            cls.name, len(inputs)
+        )
         return _op.multiply(inputs[0], inputs[0])
 
 
@@ -710,7 +728,7 @@ class AddN(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) > 0, "add_n take >=1 inputs, but 0 given."
-        
+
         res = inputs[0]
         for each in inputs[1:]:
             res = _op.add(res, each)
@@ -729,7 +747,9 @@ class ScalarAdd(OneFlowOpConverter):
         elif attrs.get("has_float_operand", False):
             return inputs[0] + _expr.const(attrs["float_operand"])
         else:
-            raise AttributeError("please check if has_int_operand or has_float_operand in your attrs")
+            raise AttributeError(
+                "please check if has_int_operand or has_float_operand in your attrs"
+            )
 
 
 class ScalarMul(OneFlowOpConverter):
@@ -744,7 +764,9 @@ class ScalarMul(OneFlowOpConverter):
         elif attrs.get("has_float_operand", False):
             return inputs[0] * _expr.const(attrs["float_operand"])
         else:
-            raise AttributeError("please check if has_int_operand or has_float_operand in your attrs")
+            raise AttributeError(
+                "please check if has_int_operand or has_float_operand in your attrs"
+            )
 
 
 class Argmax(OneFlowOpConverter):
@@ -1152,7 +1174,7 @@ class OneflowGraph(object):
         The input shape to the graph
     dtype : dict of str to str
         The input types to the graph
-    
+
     node name:
     1. param: m.layer4.1.bn1.weight / ...
     2. buffer: m.layer4.1.bn1.running_mean / ...
@@ -1215,7 +1237,7 @@ class OneflowGraph(object):
                                 node_array = node_p['params']
                                 self._params[node_input_name] = node_array
                                 self._nodes[node_input_name] = new_var(
-                                    node_input_name, 
+                                    node_input_name,
                                     shape=node_array.shape,
                                     dtype=str(node_array.dtype)
                                 )
@@ -1223,7 +1245,7 @@ class OneflowGraph(object):
             elif is_output_op(node):
                 node_output_path = getattr(node.output_conf, "in")
                 output_path = os.path.join(
-                    model_dir_path, 
+                    model_dir_path,
                     getattr(node.output_conf, "in").replace("m.", "")
                 )
                 self._output_path_2_name[output_path] = node_name
@@ -1253,14 +1275,14 @@ class OneflowGraph(object):
                                 node_replace = k
                         if node_replace is not None:
                             op_replace = copy.deepcopy(self._nodes[node_replace])
+                            self._nodes[node_name] = op_replace
                         else:
-                            warnings.warn("{} will not be in self._nodes", node_input)
-                        self._nodes[node_name] = op_replace
+                            print("{} will not be in self._nodes", node_input)
 
 
     def _parse_output(self, op_name, outputs):
         """
-        e.g.: 
+        e.g.:
         o: m.classifier.1-output_xxx
         new_o: m.classifier.1-conv2d_0
         "_"+new_o is in self._shape
@@ -1289,8 +1311,8 @@ class OneflowGraph(object):
         model_dir_path: str
             The path of parameter
         freeze_params: bool
-            If freeze_params is True, 
-            the computational graph input is the input of the first layer of the network, 
+            If freeze_params is True,
+            the computational graph input is the input of the first layer of the network,
             which cannot be specified by the user, e.g.
             Default input is: %v_ResNetGraph_0-input_0: Tensor[(1, 3, 224, 224), float32]
             User-defined input is: %_0-input_0: Tensor[(1, 3, 640, 480), float32]
@@ -1298,7 +1320,7 @@ class OneflowGraph(object):
         user_input: dict
             User-defined input information for the graph
             {
-                node1_name: 
+                node1_name:
                 {
                     'name':  node1_name,   # str, like "%v_ResNetGraph_0-input_0"
                     'shape': node1_shape,  # tuple
@@ -1306,7 +1328,7 @@ class OneflowGraph(object):
                 }
                 ...
             }
-        We recommend that users specify the input by specifying the job function, 
+        We recommend that users specify the input by specifying the job function,
         rather than by this function
 
         Returns
@@ -1320,7 +1342,10 @@ class OneflowGraph(object):
         if not freeze_params:
             for node_init_name in user_input:
                 if "0-input_0" not in node_init_name:
-                    raise KeyError("user_input['name'] should contain '0-input_0' to let program know that this is input node")
+                    raise KeyError(
+                        "user_input['name'] should contain '0-input_0' " +
+                        "to let program know that this is input node"
+                    )
                 else:
                     self._nodes[node_init_name] = new_var(
                         node_init_name,
@@ -1392,7 +1417,8 @@ class OneflowGraph(object):
                 else:
                     outputs_num = len(op)
 
-                assert (len(node_outputs) == outputs_num), "Number of output mismatch {} vs {} in {}.".format(
+                assert (len(node_outputs) == outputs_num), \
+                    "Number of output mismatch {} vs {} in {}.".format(
                     len(node_outputs), outputs_num, op_name
                 )
 
@@ -1400,7 +1426,7 @@ class OneflowGraph(object):
                     op = fold_constant(op)
                 else:
                     op = _expr.TupleWrapper(fold_constant(op.astuple()), len(op))
-                
+
                 op_temp = []
                 op_temp.append(op)
                 for i in range(len(node_outputs)):
@@ -1486,7 +1512,10 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
         import oneflow
 
         if 'snapshot_done' not in os.listdir(model_dir_path):
-            raise IndexError("'snapshot_done' is not in the model path, please determine whether the model has been trained")
+            raise IndexError(
+                "'snapshot_done' is not in the model path, " +
+                "please determine whether the model has been trained"
+            )
 
     except ImportError:
         raise ImportError("please check that OneFlow is installed")
@@ -1507,7 +1536,7 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
     # elif "int8" in graph_str:
     #     DTYPE = 4
 
-    p1 = re.compile("\[.*?\]", re.S)
+    p1 = re.compile(r"\[.*?\]", re.S)
     types = ["INPUT", "PARAMETER", "BUFFER", "OUTPUT"]
     for t in types:
         data = re.finditer(t+":.*", graph_str)
@@ -1519,7 +1548,7 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
             dtype[node_name] = FLOW_2_STR_DTYPE[DTYPE]
 
     # get graph proto, if you don't _compile the graph, the _graph_proto will be None
-    graph_input = re.search("INPUT:.*", graph_str).group().split(":")
+    graph_input = re.search(r"INPUT:.*", graph_str).group().split(":")
     shape_input = tuple(map(int, re.findall(p1, graph_input[2])[0][1:-1].split(", ")))
     if not graph._is_compiled:
         _ = graph._compile(np.random.rand(shape_input))
@@ -1534,7 +1563,7 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
 
     # Use the graph proto as a scope so that ops can access other nodes if needed.
     mod, params = g.from_oneflow(
-            nodes=nodes, model_dir_path=model_dir_path, 
+            nodes=nodes, model_dir_path=model_dir_path,
             freeze_params=freeze_params, user_input=user_input
         )
 
