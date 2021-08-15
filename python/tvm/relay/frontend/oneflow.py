@@ -571,7 +571,7 @@ class Reduce(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         attr = {
-            "axis": attrs.get("axes", 0),
+            "axis": attrs.get("axis", 0),
             "keepdims": attrs.get("keepdims", True)
             }
         return AttrCvt(cls.name)(inputs, attr)
@@ -726,6 +726,30 @@ class BroadcastDiv(BroadcastMath):
     name = "divide"
 
 
+class Greater(OneFlowOpConverter):
+    """Operator converter for greater"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        return _op.greater(inputs[0], inputs[1])
+
+
+class Log1p(OneFlowOpConverter):
+    """Operator converter for Log1p"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        return _op.log(inputs[0] + _expr.const(1.0))
+
+
+class Expm1(OneFlowOpConverter):
+    """Operator converter for Expm1"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        return _op.exp(inputs[0]) - _expr.const(1.0)
+
+
 class Unary(OneFlowOpConverter):
     """A helper class for unary op converters"""
 
@@ -790,6 +814,16 @@ class ScalarMul(OneFlowOpConverter):
             raise AttributeError(
                 "please check if has_int_operand or has_float_operand in your attrs"
             )
+
+
+class ScalarPow(OneFlowOpConverter):
+    """Operator convert for Pow_scalar"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        exponent = attrs.get("exponent", 1.0)
+        exponent = _expr.const(exponent, dtype="float32")
+        return _op.power(inputs[0], exponent)
 
 
 class Argmax(OneFlowOpConverter):
@@ -933,6 +967,28 @@ class Selu(OneFlowOpConverter):
         )
 
 
+class Silu(OneFlowOpConverter):
+    """Operator converter for Silu"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        a = inputs[0]
+        b = _op.sigmoid(inputs[0])
+        return _op.multiply(a, b)
+
+
+class Gelu(OneFlowOpConverter):
+    """Operator converter for Gelu"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        data = inputs[0]
+        return data * (
+            _expr.const(0.5)
+            + _op.erf(data * _expr.const(0.5 ** 0.5)) * _expr.const(0.5)
+        )
+
+
 class HardTanh(OneFlowOpConverter):
     """Operator converter for HardTanh"""
 
@@ -941,6 +997,25 @@ class HardTanh(OneFlowOpConverter):
         tanh_min = attrs.get("min_val", 0.0)
         tanh_max = attrs.get("max_val", 0.0)
         return _op.tensor.clip(inputs[0], tanh_min, tanh_max)
+
+
+class Softplus(OneFlowOpConverter):
+    """Operator converter for Softplus"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        data = inputs[0]
+        data_dtype = infer_type(data).checked_type.dtype
+        data = _op.exp(data) + _expr.const(1, dtype=data_dtype)
+        return _op.log(data)
+
+
+class Softsign(OneFlowOpConverter):
+    """Operator converter for Softsign"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        return inputs[0] / (_expr.const(1.0) + Absolute.get_converter()(inputs, attrs, params))
 
 
 class Concat(OneFlowOpConverter):
@@ -1026,11 +1101,49 @@ class Unsqueeze(OneFlowOpConverter):
         return inputs[0]
 
 
-class Sigmoid(OneFlowOpConverter):
+class Sign(OneFlowOpConverter):
+    """Operator converter for Sign"""
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        return inputs[0]
+        return _op.sign(inputs[0])
+
+
+class Reciprocal(OneFlowOpConverter):
+    """Operator converter for Reciprocal"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        dtype = infer_type(inputs[0]).checked_type.dtype
+        return _expr.const(1.0, dtype=dtype) / inputs[0]
+
+
+class Erf(OneFlowOpConverter):
+    """Operator converter for Erf"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        return _op.erf(inputs[0])
+
+
+class Erfc(OneFlowOpConverter):
+    """Operator converter for Erfs"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        return _expr.const(1.0) - _op.erf(inputs[0])
+
+
+class HardSigmoid(OneFlowOpConverter):
+    """Operator converter for HardSigmoid"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        alpha = attrs.get("alpha", 0.2)
+        beta = attrs.get("beta", 0.5)
+        transformX = (inputs[0] * _expr.const(alpha)) + _expr.const(beta)
+        attr = {"a_min": 0, "a_max": 1}
+        return AttrCvt("clip")([transformX], attr)
 
 
 class OneHot(OneFlowOpConverter):
@@ -1058,6 +1171,55 @@ class OneHot(OneFlowOpConverter):
         return _op.one_hot(indices, on_value, off_value, depth, axis, dtype=dtype)
 
 
+class Where(OneFlowOpConverter):
+    # TODO
+    """Operator converter for Where"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        condition_rank = len(infer_shape(inputs[0]))
+        x_rank = len(infer_shape(inputs[1]))
+        y_rank = len(infer_shape(inputs[2]))
+        ranks = [condition_rank, x_rank, y_rank]
+
+        # If one rank is longer than others, then we can broadcast
+        # to that shape.
+        max_rank = max(ranks)
+        max_rank_idxs = [i for i, x in enumerate(ranks) if x == max_rank]
+        broadcast_shape = shape_of(inputs[max_rank_idxs[0]])
+        # If two or more inputs have the same rank, compute the broadcast
+        # shape by taking the maximum value of each dimensions.
+        if len(max_rank_idxs) > 1:
+            for idx in max_rank_idxs:
+                broadcast_shape = _op.maximum(broadcast_shape, shape_of(inputs[idx]))
+
+        broadcast_shape = fold_constant(broadcast_shape)
+
+        condition = _op.broadcast_to(inputs[0], broadcast_shape)
+        x = _op.broadcast_to(inputs[1], broadcast_shape)
+        y = _op.broadcast_to(inputs[2], broadcast_shape)
+        return _op.where(condition, x, y)
+
+
+class Constant(OneFlowOpConverter):
+    """Operator converter for Constant"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        is_float = attrs.get("is_floating_value", True)
+        shape = attrs.get("shape", (1, ))
+        if is_float:
+            dtype = "float32"
+            value = attrs.pop("floating_value")
+        else:
+            dtype = "int8"
+            value = attrs.pop("integer_value")
+        np_array = np.zeros(shape)
+        np_array.fill(value)
+        value = _expr.const(np_array, dtype)
+        return value
+
+
 def get_convert_map():
     # supported oneflow2relay op
     return {
@@ -1065,6 +1227,7 @@ def get_convert_map():
         "bias_add": Add.get_converter(),
         "scalar_add": ScalarAdd.get_converter(),
         "scalar_mul": ScalarMul.get_converter(),
+        "scalar_pow": ScalarPow.get_converter(),
         "reduce_sum": ReduceSum.get_converter(),
         "reduce_max": ReduceMax.get_converter(),
         "reduce_min": ReduceMin.get_converter(),
@@ -1073,7 +1236,9 @@ def get_convert_map():
         "broadcast_mul": BroadcastMul.get_converter(),
         "broadcast_sub": BroadcastSub.get_converter(),
         "broadcast_div": BroadcastDiv.get_converter(),
+        "broadcast_greater": Greater.get_converter(),
         "log": Renamer("log"),
+        "log1p": Log1p.get_converter(),
         "acos": Renamer("acos"),
         "acosh": Renamer("acosh"),
         "asin": Renamer("asin"),
@@ -1088,6 +1253,7 @@ def get_convert_map():
         "tanh": Renamer("tanh"),
         "pow": Renamer("power"),
         "exp": Renamer("exp"),
+        "expm1": Expm1.get_converter(),
         "floor": Renamer("floor"),
         "ceil": Renamer("ceil"),
         "round": Renamer("round"),
@@ -1095,12 +1261,20 @@ def get_convert_map():
         "sqrt": Renamer("sqrt"),
         "rsqrt": Renamer("rsqrt"),
         "square": Square.get_converter(),
+        "sign": Sign.get_converter(),
+        "erf": Erf.get_converter(),
+        "erfc": Erfc.get_converter(),
+        "reciprocal_no_nan": Reciprocal.get_converter(),
         # defs/activation
-        "sigmoid": Renamer("sigmoid"),
+        "softmax": Softmax.get_converter(),
+        "softsign": Softsign.get_converter(),
         "hardtanh": HardTanh.get_converter(),
         "relu": Renamer("relu"),
         "leaky_relu": Renamer("leaky_relu"),
         "prelu": PReLU.get_converter(),
+        "selu": Selu.get_converter(),
+        "silu": Silu.get_converter(),
+        "gelu": Gelu.get_converter(),
         # defs/nn
         "conv2d": Conv2d.get_converter(),
         "deconv2d": ConvTranspose.get_converter(),
@@ -1122,20 +1296,13 @@ def get_convert_map():
         "expand_dims": Expand.get_converter(),
         # defs/others
         "reshape": Reshape.get_converter(),
+        "constant": Constant.get_converter(),
+        # "where": Where.get_converter(),
         "flatten": Flatten.get_converter(),
-        "sigmoid_v2": Sigmoid.get_converter(),
+        "sigmoid": Renamer("sigmoid"),
+        "sigmoid_v2": Renamer("sigmoid"),
+        "hardgsigmoid": HardSigmoid.get_converter(),
     }
-
-
-class Softplus(OneFlowOpConverter):
-    """Operator converter for Softplus."""
-
-    @classmethod
-    def _impl_v1(cls, inputs, attr, params):
-        data = inputs[0]
-        data_dtype = infer_type(data).checked_type.dtype
-        data = _op.exp(data) + _expr.const(1, dtype=data_dtype)
-        return _op.log(data)
 
 
 class oneflow_input(object):
@@ -1216,6 +1383,7 @@ class OneflowGraph(object):
         self._model_array = {}
         self._input_path_2_name = {}
         self._output_path_2_name = {}
+        self._init_variable_node = []
         self._shape = shape
         self._dtype = dtype
 
@@ -1267,6 +1435,12 @@ class OneflowGraph(object):
                                     dtype=str(node_array.dtype)
                                 )
                                 break
+                for output_name in node.user_conf.output:
+                    node_output_paths = getattr(node.user_conf.output[output_name], 's')
+                    for node_output_path in node_output_paths:
+                        node_path = os.path.join(model_dir_path, node_output_path.replace("m.", ""))
+                        node_output_name = node_output_path.split("/")[0]
+                        self._output_path_2_name[node_path] = node_output_name
             elif is_output_op(node):
                 node_output_path = getattr(node.output_conf, "in")
                 output_path = os.path.join(
@@ -1274,7 +1448,14 @@ class OneflowGraph(object):
                     getattr(node.output_conf, "in").replace("m.", "")
                 )
                 self._output_path_2_name[output_path] = node_name
-
+            elif is_param_op(node):
+                if "FreeEagerTensor" in node.name:
+                    shape = tuple(node.variable_conf.shape.dim)
+                    dtype = FLOW_2_STR_DTYPE[node.variable_conf.data_type]
+                    initializer = node.variable_conf.initializer
+                    self._shape[node.name] = shape
+                    self._dtype[node.name] = dtype
+                    self._init_variable_node.append(node.name)
 
     def _parse_input(self, node, model_dir_path):
         for input_name in node.user_conf.input:
@@ -1286,7 +1467,11 @@ class OneflowGraph(object):
                 node_path = os.path.join(model_dir_path, i.replace("m.", ""))
 
                 if node_input not in self._nodes:
-                    if node_path not in self._input_path_2_name or "-input_0" in node_input:
+                    if (
+                        node_path not in self._input_path_2_name
+                        or "-input_0" in node_input
+                        or "FreeEagerTensor" in node_input
+                    ):
                         self._nodes[node_input] = new_var(
                             node_input,
                             shape=node_input_shape,
@@ -1302,12 +1487,11 @@ class OneflowGraph(object):
                             op_replace = copy.deepcopy(self._nodes[node_replace])
                             self._nodes[node_name] = op_replace
                         else:
-                            print("{} will not be in self._nodes", node_input)
+                            print("{} will not be in self._nodes".format(node_input))
 
 
-    def _parse_output(self, op_name, outputs):
+    def _parse_output(self, op_name, outputs, cnt_init=0):
         """
-        e.g.:
         o: m.classifier.1-output_xxx
         new_o: m.classifier.1-conv2d_0
         "_"+new_o is in self._shape
@@ -1318,11 +1502,15 @@ class OneflowGraph(object):
                 new_o = new_o.replace("_"+new_o.split("_")[-1], "_0")
                 self._shape[o] = self._shape["_" + new_o]
                 self._dtype[o] = self._dtype["_" + new_o]
+            elif len(outputs) > 1:
+                outputs.remove(o)
         if op_name.lower() == "dropout":
             if len(output) == 1:
                 return outputs
             # TODO(zhreshold): support dropout mask? `form onnx.py`
             outputs = outputs[:-1]
+        elif op_name.lower() == "constant":
+            outputs = [self._init_variable_node[cnt_init]]
 
         return outputs
 
@@ -1389,6 +1577,7 @@ class OneflowGraph(object):
                 op_name = node.user_conf.op_type_name
                 if(
                     op_name not in convert_map
+                    and "constant" not in op_name
                     and op_name not in _identity_list
                 ):
                     unsupported_ops.add(op_name)
@@ -1408,6 +1597,7 @@ class OneflowGraph(object):
 
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
+                print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -1466,8 +1656,11 @@ class OneflowGraph(object):
         for node_name in nodes:
             node = nodes[node_name]
             if is_output_op(node):
+                node_name_v2 = getattr(node.output_conf, "in").split("/")[0]
                 if node_name in self._nodes:
                     outputs.append(self._nodes[node_name])
+                elif node_name_v2 in self._nodes:
+                    outputs.append(self._nodes[node_name_v2])
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
 
         # step 5: get the relay IR
