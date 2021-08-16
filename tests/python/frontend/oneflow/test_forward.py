@@ -384,6 +384,32 @@ def verify_math(
     tvm.testing.assert_allclose(out_flow, out_tvm, rtol=rtol, atol=atol)
 
 
+def verify_concat(
+    model, name="", rtol=1e-5, atol=1e-5,
+    inputs = [],
+    device = "llvm"
+):
+    if device == "cuda":
+        model.to(device)
+        # inputs = inputs.to(device)
+
+    graph = OneFlowGraph(model)
+    graph._compile(inputs)
+
+    mkdir(MODEL_HOME)
+
+    # snapshot_done
+    with open(os.path.join(MODEL_HOME, "snapshot_done"), "w") as f:
+        f.write("")
+
+    out_flow = get_oneflow_output(graph, inputs)
+    out_tvm = get_tvm_output(graph, MODEL_HOME, flow.Tensor(inputs), target=device)
+    rmdir(MODEL_HOME)
+
+    assert_shape(out_flow, out_tvm)
+    tvm.testing.assert_allclose(out_flow, out_tvm, rtol=rtol, atol=atol)
+
+
 # defs/nn
 @tvm.testing.uses_gpu
 def test_conv2d():
@@ -730,6 +756,59 @@ def test_math():
         verify_math(model9, device=device)
 
 
+@tvm.testing.uses_gpu
+def test_slice():
+    class Slice(flow.nn.Module):
+        def forward(self, x):
+            tup_list = [[None, None, None], [0, 5, 2], [0, 6, 3]]
+            out = flow.slice(x, slice_tup_list=tup_list)
+            return out
+    
+    model = Slice().eval()
+
+    for device in ["llvm", "cuda"]:
+        verify_math(
+            model, device=device,
+            inputs=flow.Tensor(np.random.randn(3, 6, 9).astype(np.float32))
+        )
+
+
+@tvm.testing.uses_gpu
+def test_arange():
+    class Arange(flow.nn.Module):
+        def forward(self, x):
+            out = flow.arange(end=x)
+            return out
+
+    model = Arange().eval()
+
+    for device in ["llvm", "cuda"]:
+        verify_math(
+            model, device=device,
+            inputs=flow.Tensor().fill_(np.random.randint(1, 10))
+        )
+
+
+@tvm.testing.uses_gpu
+def test_concat():
+    class Concat(flow.nn.Module):
+        def forward(self, x):
+            out = flow.cat(x, dim=1)
+            return out
+    
+    model = Concat().eval()
+
+    for device in ["llvm", "cuda"]:
+        verify_concat(
+            model, device=device,
+            inputs = [
+                flow.Tensor(np.random.randn(2, 6, 5, 3)),
+                flow.Tensor(np.random.randn(2, 6, 5, 3)),
+                flow.Tensor(np.random.randn(2, 6, 5, 3))
+            ]
+        )
+
+
 if __name__ == "__main__":
     # test_conv2d()
     # test_pool2d()
@@ -738,5 +817,10 @@ if __name__ == "__main__":
     # test_convtran()
     # test_activation()
     # test_min_max()
-    test_math()
+    # test_math()
+    # test_slice()
+    # test_arange()
+    # BUG: oneflow: tensor.numpy() is not allowed to called in nn.Graph.build(*args) or called by lazy tensor. but x.is_lazy=False and no .numpy() used in code
+    # test_concat()
+    # BUG: oneflow: in flow.Tensor([flow.Tensor]) Numpy data type 17 is not valid to OneFlow data type.
     rmdir("log")

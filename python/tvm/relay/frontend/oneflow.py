@@ -660,6 +660,15 @@ class Expand(OneFlowOpConverter):
         return out
 
 
+class ExpandDim(OneFlowOpConverter):
+    """Operator converter for ExpandDim"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+
+        return _op.expand_dims(inputs[0], axis=attrs.get("axis", 0))
+
+
 class BroadcastMath(OneFlowOpConverter):
     """Operator converter for broadcast math ops"""
 
@@ -668,8 +677,11 @@ class BroadcastMath(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
-        beta_names = ["weight", "bias", "mean", "var"]
-
+        beta_names = ["weight", "bias", "mean", "var", "Constant"]
+        for i in inputs:
+            print(i)
+            print()
+        print()
         for i in inputs:
             T_NAMES = any([x in str(i) for x in beta_names])
             if T_NAMES and "-input_0" not in str(i):
@@ -807,7 +819,7 @@ class ScalarMul(OneFlowOpConverter):
         assert len(inputs) == 1, "add_scalar take == 1 inputs, but {} given.".format(len(inputs))
 
         if attrs.get("has_int_operand", False):
-            return inputs[0] * _expr.const(attrs["int_operand"])
+            return inputs[0] * _expr.const(attrs["int_operand"], dtype="float32")
         elif attrs.get("has_float_operand", False):
             return inputs[0] * _expr.const(attrs["float_operand"])
         else:
@@ -1220,6 +1232,33 @@ class Constant(OneFlowOpConverter):
         return value
 
 
+class Range(OneFlowOpConverter):
+    """Operator converter for Range"""
+    # TODO: dtype
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        if len(inputs) != 0:
+            raise ValueError("Expect no inputs but get {}".format(len(inputs)))
+        start = attrs.get("start", 0.0)
+        limit = attrs.get("limit", 1.0)
+        delta = attrs.get("delta", 1.0)
+        return _op.arange(
+            _expr.const(start, dtype="float32"),
+            _expr.const(limit, dtype="float32"),
+            _expr.const(delta, dtype="float32"),
+        )
+
+
+class Cast(OneFlowOpConverter):
+    """Operator converter for Cast"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        attrs["dtype"] = infer_type(inputs[0]).checked_type.dtype
+        return AttrCvt(op_name="cast")(inputs, attrs)
+
+
 def get_convert_map():
     # supported oneflow2relay op
     return {
@@ -1293,7 +1332,9 @@ def get_convert_map():
         "slice": Slice.get_converter(),
         "expand": Expand.get_converter(),
         "transpose": AttrCvt("transpose", {"perm": "axes"}),
-        "expand_dims": Expand.get_converter(),
+        "expand_dims": ExpandDim.get_converter(),
+        "range": Range.get_converter(),
+        "cast": Cast.get_converter(),
         # defs/others
         "reshape": Reshape.get_converter(),
         "constant": Constant.get_converter(),
@@ -1456,6 +1497,8 @@ class OneflowGraph(object):
                     self._shape[node.name] = shape
                     self._dtype[node.name] = dtype
                     self._init_variable_node.append(node.name)
+        if self._init_variable_node != []:
+            print("{} should be defined by user".format(self._init_variable_node))
 
     def _parse_input(self, node, model_dir_path):
         for input_name in node.user_conf.input:
@@ -1511,6 +1554,9 @@ class OneflowGraph(object):
             outputs = outputs[:-1]
         elif op_name.lower() == "constant":
             outputs = [self._init_variable_node[cnt_init]]
+        
+        if len(outputs) > 1:
+            outputs = list(set(outputs))
 
         return outputs
 
@@ -1597,7 +1643,6 @@ class OneflowGraph(object):
 
                 op_name = node.user_conf.op_type_name
                 op_attr = parse_attr(node.user_conf.attr)
-                print(op_name, op_attr)
 
                 self._parse_input(
                     node,
@@ -1748,26 +1793,32 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
     dtype = {}
     graph_str = repr(graph)
     DTYPE = 2
+    size_where = 2
+    if "cuda" in graph_str:
+        size_where = 3
     # TODO(hujiakui): prepare for float16 and int8
     # if "float16" in graph_str:
     #     DTYPE = 9
     # elif "int8" in graph_str:
     #     DTYPE = 4
 
-    p1 = re.compile(r"\[.*?\]", re.S)
+    p1 = re.compile(r"size=\(.*?\)", re.S)
     types = ["INPUT", "PARAMETER", "BUFFER", "OUTPUT"]
     for t in types:
         data = re.finditer(t+":.*", graph_str)
         for i in data:
             attrs = i.group().split(":")
-            data_size = tuple(map(int, re.findall(p1, attrs[2])[0][1:-1].split(", ")))
+            size_attr = re.findall(p1, attrs[size_where])[0].replace("size=", "")
+            if size_attr[-2] == ",":
+                size_attr = size_attr.replace(",", "")
+            data_size = tuple(map(int, size_attr[1:-1].split(", ")))
             node_name = attrs[1]
             shape[node_name] = data_size
             dtype[node_name] = FLOW_2_STR_DTYPE[DTYPE]
 
     # get graph proto, if you don't _compile the graph, the _graph_proto will be None
     graph_input = re.search(r"INPUT:.*", graph_str).group().split(":")
-    shape_input = tuple(map(int, re.findall(p1, graph_input[2])[0][1:-1].split(", ")))
+    shape_input = tuple(map(int, re.findall(p1, graph_input[size_where])[0].replace("size=", "")[1:-1].split(", ")))
     if not graph._is_compiled:
         _ = graph._compile(np.random.rand(shape_input))
     graph_proto = graph._graph_proto
