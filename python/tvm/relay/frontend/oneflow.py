@@ -271,8 +271,8 @@ class Conv(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         # The kernel is imported from model_dir_path, without the ".weight" logo, etc.
-        # The data is obtained through the graph, its op contains "-input_0"
-        in_names = ["-input_0"]
+        # The data is obtained through the graph, its op contains "-input_"
+        in_names = ["-input_"]
         kernel_names = [".weight"]
         for i in inputs:
             IN_NAMES = any(x in str(i) for x in in_names)
@@ -334,7 +334,7 @@ class ConvTranspose(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        in_names = ["-input_0"]
+        in_names = ["-input_"]
         kernel_names = [".weight"]
         for i in inputs:
             IN_NAMES = any(x in str(i) for x in in_names)
@@ -387,7 +387,7 @@ class Upsample(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        in_names = ["-input_0"]
+        in_names = ["-input_"]
         kernel_names = [".weight"]
         for i in inputs:
             IN_NAMES = any(x in str(i) for x in in_names)
@@ -478,7 +478,7 @@ class BatchNorm(OneFlowOpConverter):
         # sort the inputs
         sorted_inputs = copy.deepcopy(inputs)
         for i in inputs:
-            IN_NAMES = "-input_0" in str(i)
+            IN_NAMES = "-input_" in str(i)
             if IN_NAMES:
                 sorted_inputs[0] = i
             elif 'weight' in str(i) and not IN_NAMES:
@@ -534,7 +534,7 @@ class MatMul(OneFlowOpConverter):
         )
         # Similar to 'class Conv'
         true_names = ["weight"]
-        false_names = ["-input_0"]
+        false_names = ["-input_"]
         for i in inputs:
             T_NAMES = any(x in str(i) for x in true_names)
             F_NAMES = any(x in str(i) for x in false_names)
@@ -623,7 +623,7 @@ class Add(OneFlowOpConverter):
         axis = int(attrs.get("axis", 0))
 
         true_names = ["weight", "bias"]
-        false_names = ["-input_0"]
+        false_names = ["-input_"]
 
         for i in inputs:
             T_NAMES = any(x in str(i) for x in true_names)
@@ -678,13 +678,10 @@ class BroadcastMath(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
         beta_names = ["weight", "bias", "mean", "var", "Constant"]
-        for i in inputs:
-            print(i)
-            print()
-        print()
+
         for i in inputs:
             T_NAMES = any([x in str(i) for x in beta_names])
-            if T_NAMES and "-input_0" not in str(i):
+            if T_NAMES and "-input_" not in str(i):
                 input_b = i
             else:
                 input_a = i
@@ -952,7 +949,7 @@ class PReLU(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "PReLU need 2 inputs, but {} given".format(len(inputs))
         for i in inputs:
-            if "-input_0" in str(i):
+            if "-input_" in str(i):
                 prelu_a = i
             else:
                 prelu_b = i
@@ -1512,7 +1509,7 @@ class OneflowGraph(object):
                 if node_input not in self._nodes:
                     if (
                         node_path not in self._input_path_2_name
-                        or "-input_0" in node_input
+                        or "-input_" in node_input
                         or "FreeEagerTensor" in node_input
                     ):
                         self._nodes[node_input] = new_var(
@@ -1540,7 +1537,7 @@ class OneflowGraph(object):
         "_"+new_o is in self._shape
         """
         for o in outputs:
-            if "-output_0" not in o:
+            if "-output_" not in o:
                 new_o = o.replace("-"+op_name, "-output")
                 new_o = new_o.replace("_"+new_o.split("_")[-1], "_0")
                 self._shape[o] = self._shape["_" + new_o]
@@ -1600,9 +1597,9 @@ class OneflowGraph(object):
         # step 1: get the graph input
         if not freeze_params:
             for node_init_name in user_input:
-                if "-input_0" not in node_init_name:
+                if "-input_" not in node_init_name:
                     raise KeyError(
-                        "user_input['name'] should contain '-input_0' " +
+                        "user_input['name'] should contain '-input_' " +
                         "to let program know that this is input node"
                     )
                 else:
@@ -1714,7 +1711,7 @@ class OneflowGraph(object):
         nodes = {v: k for k, v in self._nodes.items()}
         free_vars = [nodes[var] for var in free_vars]
 
-        # step 6: make sure the '-Input_0' is the first in self._inputs
+        # step 6: make sure the '-input_0' is the first in self._inputs
         for free_var in free_vars:
             if free_var not in self._inputs:
                 self._inputs[free_var] = self._nodes[free_var]
@@ -1808,7 +1805,9 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
         data = re.finditer(t+":.*", graph_str)
         for i in data:
             attrs = i.group().split(":")
-            size_attr = re.findall(p1, attrs[size_where])[0].replace("size=", "")
+            size_str = re.findall(p1, attrs[size_where])
+            assert size_str != [], "size should not be None, please check your inputs dtype"
+            size_attr = size_str[0].replace("size=", "")
             if size_attr[-2] == ",":
                 size_attr = size_attr.replace(",", "")
             data_size = tuple(map(int, size_attr[1:-1].split(", ")))

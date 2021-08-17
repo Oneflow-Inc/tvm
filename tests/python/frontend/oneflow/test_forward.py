@@ -68,8 +68,23 @@ class OneFlowGraph(flow.nn.Graph):
         return out
 
 
-def get_oneflow_output(model, inputs: flow.Tensor):
+class OneFlowGraph_v2(flow.nn.Graph):
+    def __init__(self, module):
+        super().__init__()
+        self.m = module
+
+    def build(self, x1, x2, x3):
+        out = self.m(x1, x2, x3)
+        return out
+
+
+def get_oneflow_output(model, inputs):
     flow_output = model(inputs).numpy()
+    return flow_output
+
+
+def get_oneflow_concat_output(model, input1, input2, input3):
+    flow_output = model(input1, input2, input3).numpy()
     return flow_output
 
 
@@ -84,6 +99,33 @@ def get_tvm_output(graph, model_path, inputs: flow.Tensor, target="llvm", dtype=
     with tvm.transform.PassContext(opt_level=10):
         intrp = relay.build_module.create_executor("graph", mod, device, target)
     tvm_output = intrp.evaluate()(tvm.nd.array(inputs_numpy.astype(dtype)), **params).numpy()
+    return tvm_output
+
+
+def get_tvm_concat_output(
+    graph, model_path,
+    input1: flow.Tensor,
+    input2: flow.Tensor,
+    input3: flow.Tensor,
+    target="llvm", dtype="float32"
+):
+    input1_numpy = input1.numpy()
+    input2_numpy = input2.numpy()
+    input3_numpy = input3.numpy()
+    if target == "llvm":
+        device = tvm.cpu(0)
+    elif target == "cuda":
+        device = tvm.cuda(0)
+
+    mod, params = relay.frontend.from_oneflow(graph, model_path)
+    with tvm.transform.PassContext(opt_level=10):
+        intrp = relay.build_module.create_executor("graph", mod, device, target)
+    tvm_output = intrp.evaluate()(
+        tvm.nd.array(input1_numpy.astype(dtype)),
+        tvm.nd.array(input2_numpy.astype(dtype)),
+        tvm.nd.array(input3_numpy.astype(dtype)),
+        **params
+    ).numpy()
     return tvm_output
 
 
@@ -386,15 +428,19 @@ def verify_math(
 
 def verify_concat(
     model, name="", rtol=1e-5, atol=1e-5,
-    inputs = [],
+    inputs1 = flow.Tensor(np.random.randn(2, 5, 5, 4)),
+    inputs2 = flow.Tensor(np.random.randn(2, 5, 5, 2)),
+    inputs3 = flow.Tensor(np.random.randn(2, 5, 5, 3)),
     device = "llvm"
 ):
     if device == "cuda":
         model.to(device)
-        # inputs = inputs.to(device)
+        inputs1 = inputs1.to(device)
+        inputs2 = inputs2.to(device)
+        inputs3 = inputs3.to(device)
 
-    graph = OneFlowGraph(model)
-    graph._compile(inputs)
+    graph = OneFlowGraph_v2(model)
+    graph._compile(inputs1, inputs2, inputs3)
 
     mkdir(MODEL_HOME)
 
@@ -402,8 +448,8 @@ def verify_concat(
     with open(os.path.join(MODEL_HOME, "snapshot_done"), "w") as f:
         f.write("")
 
-    out_flow = get_oneflow_output(graph, inputs)
-    out_tvm = get_tvm_output(graph, MODEL_HOME, flow.Tensor(inputs), target=device)
+    out_flow = get_oneflow_concat_output(graph, inputs1, inputs2, inputs3)
+    out_tvm = get_tvm_concat_output(graph, MODEL_HOME, inputs1, inputs2, inputs3, target=device)
     rmdir(MODEL_HOME)
 
     assert_shape(out_flow, out_tvm)
@@ -792,20 +838,31 @@ def test_arange():
 @tvm.testing.uses_gpu
 def test_concat():
     class Concat(flow.nn.Module):
-        def forward(self, x):
-            out = flow.cat(x, dim=1)
+        def forward(self, x1, x2, x3):
+            out = flow.cat([x1, x2, x3], dim=-1)
             return out
     
     model = Concat().eval()
 
     for device in ["llvm", "cuda"]:
+        verify_concat(model, device=device)
+
+
+@tvm.testing.uses_gpu
+def test_stack():
+    class Stack(flow.nn.Module):
+        def forward(self, x1, x2, x3):
+            out = flow.cat([x1, x2, x3], dim=-1)
+            return out
+    
+    model = Stack().eval()
+
+    for device in ["llvm", "cuda"]:
         verify_concat(
             model, device=device,
-            inputs = [
-                flow.Tensor(np.random.randn(2, 6, 5, 3)),
-                flow.Tensor(np.random.randn(2, 6, 5, 3)),
-                flow.Tensor(np.random.randn(2, 6, 5, 3))
-            ]
+            inputs1 = flow.Tensor(np.random.randn(2, 5, 5)),
+            inputs2 = flow.Tensor(np.random.randn(2, 5, 5)),
+            inputs3 = flow.Tensor(np.random.randn(2, 5, 5)),
         )
 
 
@@ -820,7 +877,6 @@ if __name__ == "__main__":
     # test_math()
     # test_slice()
     # test_arange()
-    # BUG: oneflow: tensor.numpy() is not allowed to called in nn.Graph.build(*args) or called by lazy tensor. but x.is_lazy=False and no .numpy() used in code
     # test_concat()
-    # BUG: oneflow: in flow.Tensor([flow.Tensor]) Numpy data type 17 is not valid to OneFlow data type.
+    # test_stack()
     rmdir("log")
