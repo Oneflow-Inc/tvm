@@ -1181,7 +1181,6 @@ class OneHot(OneFlowOpConverter):
 
 
 class Where(OneFlowOpConverter):
-    # TODO
     """Operator converter for Where"""
 
     @classmethod
@@ -1231,7 +1230,6 @@ class Constant(OneFlowOpConverter):
 
 class Range(OneFlowOpConverter):
     """Operator converter for Range"""
-    # TODO: dtype
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
@@ -1817,7 +1815,13 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
 
     # get graph proto, if you don't _compile the graph, the _graph_proto will be None
     graph_input = re.search(r"INPUT:.*", graph_str).group().split(":")
-    shape_input = tuple(map(int, re.findall(p1, graph_input[size_where])[0].replace("size=", "")[1:-1].split(", ")))
+    shape_input = tuple(
+        map(
+            int, re.findall(
+                p1, graph_input[size_where]
+            )[0].replace("size=", "")[1:-1].split(", ")
+        )
+    )
     if not graph._is_compiled:
         _ = graph._compile(np.random.rand(shape_input))
     graph_proto = graph._graph_proto

@@ -820,28 +820,12 @@ def test_slice():
 
 
 @tvm.testing.uses_gpu
-def test_arange():
-    class Arange(flow.nn.Module):
-        def forward(self, x):
-            out = flow.arange(end=x)
-            return out
-
-    model = Arange().eval()
-
-    for device in ["llvm", "cuda"]:
-        verify_math(
-            model, device=device,
-            inputs=flow.Tensor().fill_(np.random.randint(1, 10))
-        )
-
-
-@tvm.testing.uses_gpu
 def test_concat():
     class Concat(flow.nn.Module):
         def forward(self, x1, x2, x3):
             out = flow.cat([x1, x2, x3], dim=-1)
             return out
-    
+
     model = Concat().eval()
 
     for device in ["llvm", "cuda"]:
@@ -867,16 +851,15 @@ def test_stack():
 
 
 if __name__ == "__main__":
-    # test_conv2d()
-    # test_pool2d()
-    # test_normalization()
-    # test_upsample()
-    # test_convtran()
-    # test_activation()
-    # test_min_max()
-    # test_math()
-    # test_slice()
-    # test_arange()
-    # test_concat()
-    # test_stack()
+    test_conv2d()
+    test_pool2d()
+    test_normalization()
+    test_upsample()
+    test_convtran()
+    test_activation()
+    test_min_max()
+    test_math()
+    test_slice()
+    test_concat()
+    test_stack()
     rmdir("log")
