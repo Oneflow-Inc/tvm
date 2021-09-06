@@ -17,6 +17,13 @@
 # pylint: disable=invalid-name, import-self, len-as-condition, unused-argument, too-many-lines
 # pylint: disable=import-outside-toplevel
 """OF: OneFlow frontend"""
+"""
+TODO(hujiakui):
+1. where op有bug，还没有作相关测试
+2. 关于math ops, 除法和减法对a、b有要求，目前的input_name识别不到a和b，最新的graph_proto里面有
+3. 逻辑算子，类似if, or这些需要补充
+4. lstm算子测试，还有补充其他算子的tests
+"""
 import os
 import re
 import copy
@@ -1277,7 +1284,7 @@ class RNN(OneFlowOpConverter):
             "HardSigmoid",
             "Elu",
         ]
-        return activation.decode("utf-8") in needs_alpha
+        return activation in needs_alpha
 
     @classmethod
     def _activation_needs_beta(cls, activation):
@@ -1286,7 +1293,7 @@ class RNN(OneFlowOpConverter):
             "ScaledTanh",
             "HardSigmoid",
         ]
-        return activation.decode("utf-8") in needs_beta
+        return activation in needs_beta
 
 
 class LSTM(RNN):
