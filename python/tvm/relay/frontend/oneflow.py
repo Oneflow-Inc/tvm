@@ -316,9 +316,7 @@ class Conv(OneFlowOpConverter):
 
         out = AttrCvt(
             op_name=cls.name,
-            transforms={
-                "group": ("groups", 1),
-            },
+            transforms={"group": ("groups", 1),},
             ignores=["data_format", "filters", "padding_after", "padding_before"],
             custom_check=dimension_constraint(),
         )([data, kernel], attrs, params)
@@ -366,9 +364,7 @@ class ConvTranspose(OneFlowOpConverter):
 
         out = AttrCvt(
             op_name=cls.name,
-            transforms={
-                "group": ("groups", 1),
-            },
+            transforms={"group": ("groups", 1),},
             disables=["filters", "data_format", "padding_before"],
             custom_check=dimension_constraint(),
         )([data, kernel], attrs, params)
@@ -734,6 +730,15 @@ class Log1p(OneFlowOpConverter):
         return _op.log(inputs[0] + _expr.const(1.0))
 
 
+class Pow(OneFlowOpConverter):
+    """Operator converter for Power"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        inputs = _dtype_shape_promotion(inputs)
+        return get_relay_op(cls.name)(inputs[0], inputs[1])
+
+
 class Expm1(OneFlowOpConverter):
     """Operator converter for Expm1"""
 
@@ -817,9 +822,11 @@ class ScalarPow(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        exponent = attrs.get("exponent", 1.0)
-        exponent = _expr.const(exponent, dtype="float32")
-        return _op.power(inputs[0], exponent)
+        if attrs.get("has_int_operand", True):
+            coeff = _expr.const(attrs["int_operand"])
+        elif attrs.get("has_float_operand", True):
+            coeff = _expr.const(attrs["float_operand"])
+        return _op.power(inputs[0], coeff)
 
 
 class MaxPool2d(Pool):
@@ -967,7 +974,7 @@ class Gelu(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         data = inputs[0]
         return data * (
-            _expr.const(0.5) + _op.erf(data * _expr.const(0.5**0.5)) * _expr.const(0.5)
+            _expr.const(0.5) + _op.erf(data * _expr.const(0.5 ** 0.5)) * _expr.const(0.5)
         )
 
 
@@ -1258,7 +1265,7 @@ def get_convert_map():
         "sinh": Renamer("sinh"),
         "tan": Renamer("tan"),
         "tanh": Renamer("tanh"),
-        "pow": Renamer("power"),
+        "pow": Pow.get_converter(),
         "exp": Renamer("exp"),
         "expm1": Expm1.get_converter(),
         "floor": Renamer("floor"),
@@ -1271,7 +1278,7 @@ def get_convert_map():
         "sign": Sign.get_converter(),
         "erf": Erf.get_converter(),
         "erfc": Erfc.get_converter(),
-        "reciprocal_no_nan": Reciprocal.get_converter(),
+        "reciprocal": Reciprocal.get_converter(),
         # defs/activation
         "softmax": Softmax.get_converter(),
         "softsign": Softsign.get_converter(),
@@ -1380,9 +1387,7 @@ def deal_with_input_convert(
             or "FreeEagerTensor" in node_input
         ):
             _nodes[node_input] = new_var(
-                node_input,
-                shape=node_input_shape,
-                dtype=node_input_dtype,
+                node_input, shape=node_input_shape, dtype=node_input_dtype,
             )
         else:
             names = _input_path_2_name[node_path]
@@ -1548,58 +1553,11 @@ class OneflowGraph(object):
 
         return outputs
 
-    def from_oneflow(self, nodes, model_dir_path, freeze_params=True, user_input=None):
+    def from_oneflow(self, nodes, model_dir_path):
         """
-        Parameters
-        ----------
-        nodes : dict, keys: node.name, value: node
-            contain the graph
-        model_dir_path: str
-            The path of parameter
-        freeze_params: bool
-            If freeze_params is True,
-            the computational graph input is the input of the first layer of the network,
-            which cannot be specified by the user, e.g.
-            Default input is: %v_ResNetGraph_0_input.0: Tensor[(1, 3, 224, 224), float32]
-            User-defined input is: %_0_input.0: Tensor[(1, 3, 640, 480), float32]
-            If freeze_params is on, then conv1-in will be the graph input, not Input_0
-        user_input: dict
-            User-defined input information for the graph
-            {
-                node1_name:
-                {
-                    'name':  node1_name,   # str, like "%v_ResNetGraph_0_input.0"
-                    'shape': node1_shape,  # tuple
-                    'dtype': node1_dtype   # str, like "float32"
-                }
-                ...
-            }
-        We recommend that users specify the input by specifying the job function,
-        rather than by this function
-
-        Returns
-        -------
-        mod : tvm.IRModule
-            The returned relay module
-        params : dict
-            A dict of name: tvm.nd.array pairs, used as pretrained weights
+        Implementation of convert the OneFlow model into an equivalent Relay Function.
         """
-        # step 1: get the graph input
-        if not freeze_params:
-            for node_init_name in user_input:
-                if "_input." not in node_init_name:
-                    raise KeyError(
-                        "user_input['name'] should contain '_input.' "
-                        + "to let program know that this is input node"
-                    )
-                self._nodes[node_init_name] = new_var(
-                    node_init_name,
-                    shape=user_input[node_init_name]["shape"],
-                    dtype=user_input[node_init_name]["dtype"],
-                )
-                self._inputs[node_init_name] = self._nodes[node_init_name]
-
-        # step 2: find out if unsupported ops are used
+        # step 1: find out if unsupported ops are used
         convert_map = get_convert_map()
         unsupported_ops = set()
         for node_name in nodes:
@@ -1619,7 +1577,7 @@ class OneflowGraph(object):
             msg += ", ".join(unsupported_ops)
             raise tvm.error.OpNotImplemented(msg)
 
-        # step 3: convert op
+        # step 2: convert op
         for node_name in nodes:
             node = nodes[node_name]
             if is_user_op(node):
@@ -1678,7 +1636,7 @@ class OneflowGraph(object):
                     else:
                         self._nodes[node_outputs[i]] = op_temp[i]
 
-        # step 4: get the outputs
+        # step 3: get the outputs
         outputs = []
         for node_name in nodes:
             node = nodes[node_name]
@@ -1690,13 +1648,13 @@ class OneflowGraph(object):
                     outputs.append(self._nodes[node_name_v2])
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
 
-        # step 5: get the relay IR
+        # step 4: get the relay IR
         free_vars = analysis.free_vars(outputs)
 
         nodes = {v: k for k, v in self._nodes.items()}
         free_vars = [nodes[var] for var in free_vars]
 
-        # step 6: make sure the '_input.0' is the first in self._inputs
+        # step 5: make sure the '_input.0' is the first in self._inputs
         for free_var in free_vars:
             if free_var not in self._inputs:
                 self._inputs[free_var] = self._nodes[free_var]
@@ -1708,7 +1666,7 @@ class OneflowGraph(object):
             else:
                 raise IndexError("{} is not in self._inputs".format(input_name))
 
-        # step 7: create a function from our output expression and all input variables.
+        # step 6: create a function from our output expression and all input variables.
         func = _function.Function([v for _, v in self._sort_inputs.items()], outputs)
 
         return IRModule.from_expr(func), self._params
@@ -1740,19 +1698,35 @@ class OneflowGraph(object):
         return sym
 
 
-def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
-    """
-    see OneflowGraph.from_oneflow
+def from_oneflow(graph, model_dir_path):
+    """Convert a OneFlow model into an equivalent Relay Function.
+
+    At present, there are two ways to run models in deep learning framework, Dynamic Graph and Static Graph, 
+    which are also called Eager Mode and Graph Mode in OneFlow.
+
+    In general, dynamic graphs are easier to use and static graphs have better performance. 
+    OneFlow offers nn.Graph, so that users can use the eager-like programming style to build static graphs and train the models.
+
+    We utilize the intermediate representation of nn.Graph to convert the OneFlow model to Reley.
+
+    Parameters
+    ----------
+    nodes : dict, keys: node.name, value: node
+        contain the graph
+    model_dir_path: str
+        The path of weight
+
+    Returns
+    -------
+    mod : tvm.IRModule
+        The returned relay module
+    params : dict
+        A dict of name: tvm.nd.array pairs, used as pretrained weights
     """
     try:
         import oneflow as flow
     except ImportError:
         raise ImportError("please check that OneFlow is installed")
-
-    if not freeze_params and user_input is None:
-        raise ValueError("if you want to specify graph input, please give the 'user_input'")
-    if freeze_params and user_input is not None:
-        warnings.warn("'user_input' will not work, please check the 'freeze_params'")
 
     # get info of nodes
     shape = {}
@@ -1807,11 +1781,6 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
     g = OneflowGraph(shape, dtype, nodes, model_dir_path)
 
     # Use the graph proto as a scope so that ops can access other nodes if needed.
-    mod, params = g.from_oneflow(
-        nodes=nodes,
-        model_dir_path=model_dir_path,
-        freeze_params=freeze_params,
-        user_input=user_input,
-    )
+    mod, params = g.from_oneflow(nodes=nodes, model_dir_path=model_dir_path)
 
     return mod, params

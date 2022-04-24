@@ -89,6 +89,10 @@ def get_oneflow_concat_output(model, input1, input2, input3):
     return flow_output
 
 
+def get_oneflow_elementwise_output(model, input1, input2):
+    return model(input1, input2)
+
+
 def get_tvm_output(graph, model_path, inputs: flow.tensor, target="llvm", dtype="float32"):
     inputs_numpy = inputs.numpy()
     if target == "llvm":
@@ -132,15 +136,33 @@ def get_tvm_concat_output(
     return tvm_output
 
 
+def get_tvm_elementwise_output(
+    graph, model_path, input1: flow.tensor, input2: flow.tensor, target="llvm", dtype="float32",
+):
+    input1_numpy = input1.numpy()
+    input2_numpy = input2.numpy()
+    if target == "llvm":
+        device = tvm.cpu(0)
+    elif target == "cuda":
+        device = tvm.cuda(0)
+
+    mod, params = relay.frontend.from_oneflow(graph, model_path)
+    with tvm.transform.PassContext(opt_level=10):
+        intrp = relay.build_module.create_executor("graph", mod, device, target)
+    tvm_output = intrp.evaluate()(
+        tvm.nd.array(input1_numpy.astype(dtype)),
+        tvm.nd.array(input2_numpy.astype(dtype)),
+        **params,
+    ).numpy()
+    return tvm_output
+
+
 def verify_conv(
     model,
     name="",
     rtol=1e-5,
     atol=1e-5,
-    inputs=flow.tensor(
-        np.random.rand(1, 3, 224, 224),
-        dtype=flow.float32,
-    ),
+    inputs=flow.tensor(np.random.rand(1, 3, 224, 224), dtype=flow.float32,),
     device="llvm",
 ):
     if device == "cuda":
@@ -166,10 +188,7 @@ def verify_pool(
     name="",
     rtol=1e-5,
     atol=1e-5,
-    inputs=flow.tensor(
-        np.random.rand(1, 3, 224, 224),
-        dtype=flow.float32,
-    ),
+    inputs=flow.tensor(np.random.rand(1, 3, 224, 224), dtype=flow.float32,),
     device="llvm",
 ):
     if device == "cuda":
@@ -195,10 +214,7 @@ def verify_normalization(
     name="",
     rtol=1e-5,
     atol=1e-5,
-    inputs=flow.tensor(
-        np.random.rand(1, 3, 224, 224),
-        dtype=flow.float32,
-    ),
+    inputs=flow.tensor(np.random.rand(1, 3, 224, 224), dtype=flow.float32,),
     device="llvm",
 ):
     if device == "cuda":
@@ -225,10 +241,7 @@ def verify_upsample(
     name="",
     rtol=1e-5,
     atol=1e-5,
-    inputs=flow.tensor(
-        np.random.rand(1, 3, 50, 50),
-        dtype=flow.float32,
-    ),
+    inputs=flow.tensor(np.random.rand(1, 3, 50, 50), dtype=flow.float32,),
     device="llvm",
 ):
     if device == "cuda":
@@ -254,10 +267,7 @@ def verify_convtran(
     name="",
     rtol=1e-5,
     atol=1e-5,
-    inputs=flow.tensor(
-        np.random.rand(1, 3, 50, 50),
-        dtype=flow.float32,
-    ),
+    inputs=flow.tensor(np.random.rand(1, 3, 50, 50), dtype=flow.float32,),
     device="llvm",
 ):
     if device == "cuda":
@@ -283,10 +293,7 @@ def verify_activation(
     name="",
     rtol=1e-5,
     atol=1e-5,
-    inputs=flow.tensor(
-        np.random.rand(10, 10),
-        dtype=flow.float32,
-    ),
+    inputs=flow.tensor(np.random.rand(10, 10), dtype=flow.float32,),
     device="llvm",
 ):
     if device == "cuda":
@@ -312,10 +319,7 @@ def verify_math(
     name="",
     rtol=1e-5,
     atol=1e-5,
-    inputs=flow.tensor(
-        np.random.rand(100, 1),
-        dtype=flow.float32,
-    ),
+    inputs=flow.tensor(np.random.rand(100, 1), dtype=flow.float32,),
     device="llvm",
 ):
     if device == "cuda":
@@ -330,6 +334,34 @@ def verify_math(
 
     out_flow = get_oneflow_output(graph, inputs)
     out_tvm = get_tvm_output(graph, MODEL_HOME, inputs, target=device)
+    rmdir(MODEL_HOME)
+
+    assert_shape(out_flow, out_tvm)
+    tvm.testing.assert_allclose(out_flow, out_tvm, rtol=rtol, atol=atol)
+
+
+def verify_math_elementwise(
+    model,
+    name="",
+    rtol=1e-5,
+    atol=1e-5,
+    input=flow.tensor(np.random.rand(100, 1), dtype=flow.float32,),
+    device="llvm",
+):
+    input_y = flow.randn(input.shape)
+    if device == "cuda":
+        model.to(device)
+        input = input.to(device)
+        input_y = input_y.to(device)
+
+    graph = OneFlowGraph(model)
+    graph._compile(input, input_y)
+
+    mkdir(MODEL_HOME)
+    flow.save(model.state_dict(), MODEL_HOME)
+
+    out_flow = get_oneflow_elementwise_output(graph, input, input_y)
+    out_tvm = get_tvm_elementwise_output(graph, MODEL_HOME, input, input_y, target=device)
     rmdir(MODEL_HOME)
 
     assert_shape(out_flow, out_tvm)
@@ -671,6 +703,8 @@ def test_math():
     model4 = Log2().eval()
     model5 = Exp().eval()
     model6 = Exp2().eval()
+    model7 = Reciprocal().eval()
+    model8 = Pow().eval()
 
     for device in ["llvm"]:
         verify_math(model1, device=device)
@@ -679,6 +713,20 @@ def test_math():
         verify_math(model4, device=device)
         verify_math(model5, device=device)
         verify_math(model6, device=device)
+        verify_math(model7, device=device)
+        verify_math(model8, device=device)
+
+
+@tvm.testing.uses_gpu
+def test_math_elementwise():
+    class Pow(flow.nn.Module):
+        def forward(self, x, y):
+            return flow.pow(x, y)
+
+    model1 = Pow().eval()
+
+    for device in ["llvm"]:
+        verify_math_elementwise(model1, device=device)
 
 
 @tvm.testing.uses_gpu
