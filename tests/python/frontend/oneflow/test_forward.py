@@ -633,6 +633,15 @@ def test_activation():
         def forward(self, x):
             x = self.active(x)
             return x
+    
+    class HardTanh(flow.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.active = flow.nn.Hardtanh()
+
+        def forward(self, x):
+            x = self.active(x)
+            return x
 
     if os.path.exists(MODEL_HOME):
         rmdir(MODEL_HOME)
@@ -648,6 +657,7 @@ def test_activation():
     model9 = SiLU().eval()
     model10 = LeakyReLU().eval()
     model11 = GELU().eval()
+    model12 = HardTanh().eval()
 
     for device in ["llvm"]:
         verify_activation(model1, device=device)
@@ -661,6 +671,7 @@ def test_activation():
         verify_activation(model9, device=device)
         verify_activation(model10, device=device)
         verify_activation(model11, device=device)
+        verify_activation(model12, device=device)
 
 
 @tvm.testing.uses_gpu
@@ -757,6 +768,46 @@ def test_concat():
     for device in ["llvm"]:
         verify_concat(model, device=device)
 
+@tvm.testing.uses_gpu
+def test_add_constant():
+    class ConstantAdd(flow.nn.Module):
+        def forward(self, x):
+            out = flow.add(1.0, x)
+            return out
+
+    model = ConstantAdd().eval()
+
+    for device in ["llvm"]:
+        verify_math(
+            model, device=device, inputs=flow.tensor(np.random.randn(3, 6, 9).astype(np.float32))
+        )
+
+
+@tvm.testing.uses_gpu
+def test_logical():
+    class LogicalGreater(flow.nn.Module):
+        def forward(self, x):
+            return x > 1.0
+
+    model1 = LogicalGreater().eval()
+
+    for device in ["llvm"]:
+        verify_math(
+            model1, device=device, inputs=flow.tensor(np.random.randn(3, 6, 9).astype(np.float32))
+        )
+
+@tvm.testing.uses_gpu
+def test_where():
+    class Where(flow.nn.Module):
+        def forward(self, x):
+            return flow.where(x > 0.5, x, x * 2)
+
+    model1 = Where().eval()
+
+    for device in ["llvm"]:
+        verify_math(
+            model1, device=device, inputs=flow.tensor(np.random.randn(3, 6, 9).astype(np.int32))
+        )
 
 if __name__ == "__main__":
     test_conv2d()
@@ -768,4 +819,7 @@ if __name__ == "__main__":
     test_math()
     test_slice()
     test_concat()
+    test_add_constant()
+    test_logical()
+    test_where()
     rmdir("log")

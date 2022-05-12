@@ -113,7 +113,6 @@ def _dtype_shape_promotion(inputs):
             inputs[i] = input_op.astype(max_dtype)
     return inputs
 
-
 def parse_attr(attr):
     """Parse attribute of user op in oneflow."""
     attrs = {}
@@ -264,8 +263,6 @@ class GlobalMaxPool(OneFlowOpConverter):
             "Global max pooling is only implemented for 1D, 2D, and 3D kernels, got %dD."
             % (rank - 2),
         )
-
-
 class Conv(OneFlowOpConverter):
     """A helper class for conv op converters."""
 
@@ -714,12 +711,21 @@ class BroadcastDiv(BroadcastMath):
     name = "divide"
 
 
-class Greater(OneFlowOpConverter):
+class LogicalGreater(OneFlowOpConverter):
     """Operator converter for greater"""
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        return _op.greater(inputs[0], inputs[1])
+        if attrs.get("has_int_operand", True):
+            value = attrs.get("int_operand", 0.0)
+            return _op.greater(inputs[0], _op.full_like(inputs[0], fill_value=_expr.const(value)))
+        elif attrs.get("has_float_operand", True):
+            value = float(attrs.get("float_operand", 0.0))
+            return _op.greater(inputs[0], _op.full_like(inputs[0], fill_value=_expr.const(value)).astype("float32"))
+        else:
+            raise AttributeError(
+                "please check if has_int_operand or has_float_operand in your attrs"
+            )
 
 
 class Log1p(OneFlowOpConverter):
@@ -1165,6 +1171,7 @@ class Where(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
+        inputs = _dtype_shape_promotion(inputs)
         condition_rank = len(infer_shape(inputs[0]))
         x_rank = len(infer_shape(inputs[1]))
         y_rank = len(infer_shape(inputs[2]))
@@ -1250,7 +1257,7 @@ def get_convert_map():
         "broadcast_mul": BroadcastMul.get_converter(),
         "broadcast_sub": BroadcastSub.get_converter(),
         "broadcast_div": BroadcastDiv.get_converter(),
-        "broadcast_greater": Greater.get_converter(),
+        "scalar_logical_greater": LogicalGreater.get_converter(),
         "log": Renamer("log"),
         "log1p": Log1p.get_converter(),
         "acos": Renamer("acos"),
@@ -1313,11 +1320,12 @@ def get_convert_map():
         # defs/others
         "reshape": Reshape.get_converter(),
         "constant": Constant.get_converter(),
-        # "where": Where.get_converter(),
+        "where": Where.get_converter(),
         "flatten": Flatten.get_converter(),
         "sigmoid": Renamer("sigmoid"),
         "sigmoid_v2": Renamer("sigmoid"),
         "hardsigmoid": HardSigmoid.get_converter(),
+        "softplus": Softplus.get_converter(),
         "squeeze": AttrCvt("squeeze", {"axes": "axis"}),
         "unsqueeze": Unsqueeze.get_converter(),
     }
@@ -1621,7 +1629,6 @@ class OneflowGraph(object):
                 ), "Number of output mismatch {} vs {} in {}.".format(
                     len(node_outputs), outputs_num, op_name
                 )
-
                 if outputs_num == 1:
                     op = fold_constant(op)
                 else:
