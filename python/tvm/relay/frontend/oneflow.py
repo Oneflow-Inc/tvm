@@ -823,6 +823,24 @@ class ScalarMul(OneFlowOpConverter):
         return res
 
 
+class ScalarDiv(OneFlowOpConverter):
+    """Operator convert for Div_scalar"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        assert len(inputs) == 1, "div_scalar take == 1 inputs, but {} given.".format(len(inputs))
+
+        if attrs.get("has_int_operand", True):
+            res = inputs[0] / _expr.const(attrs["int_operand"], dtype="float32")
+        elif attrs.get("has_float_operand", True):
+            res = inputs[0] / _expr.const(attrs["float_operand"])
+        else:
+            raise AttributeError(
+                "please check if has_int_operand or has_float_operand in your attrs"
+            )
+
+        return res
+
 class ScalarPow(OneFlowOpConverter):
     """Operator convert for Pow_scalar"""
 
@@ -1248,6 +1266,7 @@ def get_convert_map():
         "bias_add": Add.get_converter(),
         "scalar_add": ScalarAdd.get_converter(),
         "scalar_mul": ScalarMul.get_converter(),
+        "scalar_div": ScalarDiv.get_converter(),
         "scalar_pow": ScalarPow.get_converter(),
         "reduce_sum": ReduceSum.get_converter(),
         "reduce_max": ReduceMax.get_converter(),
@@ -1328,6 +1347,7 @@ def get_convert_map():
         "softplus": Softplus.get_converter(),
         "squeeze": AttrCvt("squeeze", {"axes": "axis"}),
         "unsqueeze": Unsqueeze.get_converter(),
+        "identity": Renamer("copy"),
     }
 
 
@@ -1415,7 +1435,7 @@ def deal_parameter_convert(
 ):
     """deal with parameter(weight) convert in oneflow."""
     for node_input_path in node_input_paths:
-        node_path = os.path.join(model_dir_path, node_input_path.replace("m.", ""))
+        node_path = os.path.join(model_dir_path, node_input_path.replace("m.", "", 1))
         node_input_name = node_input_path.split("/")[0]
         _input_path_2_name[node_path] = node_input_name
         for param_name in _model_array:

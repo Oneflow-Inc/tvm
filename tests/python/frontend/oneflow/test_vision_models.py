@@ -33,6 +33,7 @@ from flowvision.models.alexnet import alexnet
 from flowvision.models.squeezenet import squeezenet1_0
 from flowvision.models.shufflenet_v2 import shufflenet_v2_x0_5
 from flowvision.models.mobilenet import mobilenet_v2
+from flowvision.models.ghostnet import ghostnet
 
 MODEL_HOME = "test_model"
 
@@ -152,6 +153,15 @@ def test_vision_models():
         def forward(self, x):
             x = self.net(x)
             return x
+    
+    class GhostNet(flow.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = ghostnet()
+
+        def forward(self, x):
+            x = self.net(x)
+            return x
 
     if os.path.exists(MODEL_HOME):
         rmdir(MODEL_HOME)
@@ -160,12 +170,14 @@ def test_vision_models():
     vision_squeezenet = SqueezeNet().eval()
     vision_shufflenet = ShuffleNet().eval()
     vision_mobilenetv2 = MobileNetV2().eval()
+    vision_ghostnet = ghostnet().eval()
 
     for device in ["llvm"]:
         verify_model(vision_alexnet, device=device)
         verify_model(vision_squeezenet, device=device)
         verify_model(vision_shufflenet, device=device)
         verify_model(vision_mobilenetv2, device=device)
+        verify_model(vision_ghostnet, device=device)
 
 if __name__ == "__main__":
     test_vision_models()
