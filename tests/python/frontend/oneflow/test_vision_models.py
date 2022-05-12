@@ -30,7 +30,8 @@ from tvm.contrib import graph_executor
 
 import oneflow as flow
 from flowvision.models.alexnet import alexnet
-from flowvision.models.vgg import vgg11
+from flowvision.models.squeezenet import squeezenet1_0
+from flowvision.models.shufflenet_v2 import shufflenet_v2_x0_5
 
 MODEL_HOME = "test_model"
 
@@ -124,25 +125,35 @@ def test_vision_models():
             x = self.net(x)
             return x
 
-    class VGG11(flow.nn.Module):
+    class SqueezeNet(flow.nn.Module):
         def __init__(self):
             super().__init__()
-            self.net = vgg11()
+            self.net = squeezenet1_0()
 
         def forward(self, x):
             x = self.net(x)
             return x
 
+    class ShuffleNet(flow.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = shufflenet_v2_x0_5()
+
+        def forward(self, x):
+            x = self.net(x)
+            return x
 
     if os.path.exists(MODEL_HOME):
         rmdir(MODEL_HOME)
 
     vision_alexnet = AlexNet().eval()
-    vision_vgg11 = VGG11().eval()
+    vision_squeezenet = SqueezeNet().eval()
+    vision_shufflenet = ShuffleNet().eval()
 
     for device in ["llvm"]:
         verify_model(vision_alexnet, device=device)
-        verify_model(vision_vgg11, device=device)
+        verify_model(vision_squeezenet, device=device)
+        verify_model(vision_shufflenet, device=device)
 
 if __name__ == "__main__":
     test_vision_models()
