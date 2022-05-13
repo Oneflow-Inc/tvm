@@ -391,7 +391,6 @@ def verify_matmul(
 
     graph = OneFlowGraph_v3(model)
     graph._compile(inputs1, inputs2)
-
     mkdir(MODEL_HOME)
     flow.save(model.state_dict(), MODEL_HOME)
 
@@ -741,6 +740,10 @@ def test_math():
     class Exp2(flow.nn.Module):
         def forward(self, x):
             return flow.expm1(x)
+    
+    class Variance(flow.nn.Module):
+        def forward(self, x):
+            return flow.var(x, 1, unbiased=False, keepdim=True)
 
     model1 = Sigmoid().eval()
     model2 = Sign().eval()
@@ -750,6 +753,7 @@ def test_math():
     model6 = Exp2().eval()
     model7 = Reciprocal().eval()
     model8 = Pow().eval()
+    model9 = Variance().eval()
 
     for device in ["llvm"]:
         verify_math(model1, device=device)
@@ -760,6 +764,7 @@ def test_math():
         verify_math(model6, device=device)
         verify_math(model7, device=device)
         verify_math(model8, device=device)
+        verify_math(model9, device=device)
 
 
 @tvm.testing.uses_gpu
@@ -881,17 +886,17 @@ def test_matmul():
 
 
 if __name__ == "__main__":
-    test_conv2d()
-    test_pool2d()
-    test_normalization()
-    test_upsample()
-    test_convtran()
-    test_activation()
-    test_math()
-    test_slice()
-    test_concat()
-    test_add_constant()
-    test_logical()
+    # test_conv2d()
+    # test_pool2d()
+    # test_normalization()
+    # test_upsample()
+    # test_convtran()
+    # test_activation()
+    # test_math()
+    # test_slice()
+    # test_concat()
+    # test_add_constant()
+    # test_logical()
     # test_where()
     test_matmul()
     rmdir("log")

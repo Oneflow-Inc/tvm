@@ -21,7 +21,7 @@
 import os
 import re
 import copy
-import warnings
+from collections import OrderedDict
 
 import numpy as np
 import tvm
@@ -38,7 +38,6 @@ from .common import (
     Renamer,
     fold_constant,
     get_relay_op,
-    infer_channels,
     infer_shape,
     infer_type,
     new_var,
@@ -512,24 +511,6 @@ class MatMul(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         assert len(inputs) == 2, "MatMul op take 2 inputs, {} given".format(len(inputs))
-        # Similar to 'class Conv'
-        true_names = ["weight"]
-        false_names = ["_input."]
-        matmul_a_flag = False
-        matmul_b_flag = False
-        for i in inputs:
-            T_NAMES = any(x in str(i) for x in true_names)
-            F_NAMES = any(x in str(i) for x in false_names)
-            if T_NAMES and not F_NAMES:
-                matmul_b = i
-                matmul_b_flag = True
-            else:
-                matmul_a = i
-                matmul_a_flag = True
-
-        if matmul_a_flag and matmul_b_flag:
-            inputs[0] = matmul_a
-            inputs[1] = matmul_b
 
         dtype = infer_type(inputs[0]).checked_type.dtype
         # Y = alpha * A * B
@@ -543,27 +524,28 @@ class MatMul(OneFlowOpConverter):
             (transA and not transB and a_shape[-2] != b_shape[-2]) or 
             (transB and not transA and a_shape[-1] != b_shape[-1]) or
             (not transB and not transA and a_shape[-1] != b_shape[-2])):
-            tmp1 = inputs[0]
-            tmp2 = inputs[1]
-            inputs[0] = tmp2
-            inputs[1] = tmp1
+            matmul_a = inputs[1]
+            matmul_b = inputs[0]
+        else:
+            matmul_a = inputs[0]
+            matmul_b = inputs[1]
 
         if transA:
             perm = list(range(len(a_shape)))
             perm[-2] = len(a_shape) - 1
             perm[-1] = len(a_shape) - 2
-            inputs[0] = _op.transpose(inputs[0], axes=perm)
+            matmul_a = _op.transpose(matmul_a, axes=perm)
         if transB:
             perm = list(range(len(b_shape)))
             perm[-2] = len(b_shape) - 1
             perm[-1] = len(b_shape) - 2
-            inputs[1] = _op.transpose(inputs[1], axes=perm)
+            matmul_b = _op.transpose(matmul_b, axes=perm)
 
         # This implemention almost keeps same with ONNX
         # Need to check input shape as batch matmul must be supported.
-        a_shape = shape_of(inputs[0], dtype="int32")
+        a_shape = shape_of(matmul_a, dtype="int32")
         a_rank = infer_shape(a_shape)[0]
-        b_shape = shape_of(inputs[1], dtype="int32")
+        b_shape = shape_of(matmul_b, dtype="int32")
         b_rank = infer_shape(b_shape)[0]
         # When performing a batch matmul, we need to properly handle N-dim shapes.
         if a_rank > 2 or b_rank > 2:
@@ -582,16 +564,16 @@ class MatMul(OneFlowOpConverter):
                 out = _op.reshape(x, fold_constant(newshape))
                 return out
 
-            b_type = infer_type(inputs[1])
+            b_type = infer_type(matmul_b)
             # Convert to dense if the second matrix is 2d and non-dynamic
             if b_rank == 2 and not _ty.is_dynamic(b_type.checked_type):
-                a = flatten_to_nd(inputs[0], a_shape, 2)
-                b = _op.transpose(inputs[1])
+                a = flatten_to_nd(matmul_a, a_shape, 2)
+                b = _op.transpose(matmul_b)
                 output = _op.nn.dense(a, b)
             else:
                 # Convert a and b into 3 dimensional tensors.
-                a = flatten_to_nd(inputs[0], a_shape, 3)
-                b = flatten_to_nd(inputs[1], b_shape, 3)
+                a = flatten_to_nd(matmul_a, a_shape, 3)
+                b = flatten_to_nd(matmul_b, b_shape, 3)
                 # Transpose matrix dimensions of b.
                 b = _op.transpose(b, [0, 2, 1])
                 # Perform a batch matmul.
@@ -630,10 +612,10 @@ class MatMul(OneFlowOpConverter):
             out = _op.reshape(output, fold_constant(final_shape))
         else:
             if b_rank == 1:
-                inputs[1] = _op.expand_dims(inputs[1], 1, 1)
+                matmul_b = _op.expand_dims(matmul_b, 1, 1)
             # Otherwise a simple dense op will get the job done.
-            input_1_t = _op.transpose(inputs[1], axes=(1, 0))
-            out = _op.nn.dense(inputs[0], input_1_t)
+            input_1_t = _op.transpose(matmul_b, axes=(1, 0))
+            out = _op.nn.dense(matmul_a, input_1_t)
             if b_rank == 1:
                 out = _op.squeeze(out, axis=[-1])
         if not np.isclose(alpha, 1.0):
@@ -726,9 +708,9 @@ class Expand(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         input_shape = infer_shape(inputs[0])
-        assert input_shape == attrs["in_shape"], "shape wrong"
+        assert input_shape == attrs["logical_in_shape"], "shape wrong"
 
-        new_shape = attrs["out_shape"]
+        new_shape = attrs["logical_expand_shape"]
         out = _op.broadcast_to(inputs[0], shape=new_shape)
 
         return out
@@ -1128,6 +1110,16 @@ class Softsign(OneFlowOpConverter):
         return inputs[0] / (_expr.const(1.0) + Absolute.get_converter()(inputs, attrs, params))
 
 
+class Variance(OneFlowOpConverter):
+    """Operator converter for Variance"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        axis = attrs["dim"]
+        keepdims = attrs["keepdim"]
+        unbiased = bool(attrs["unbiased"])
+        return _op.reduce.variance(inputs[0], axis=axis, keepdims=keepdims, unbiased=unbiased)
+
 class Concat(OneFlowOpConverter):
     """Operator converter for Concat"""
 
@@ -1286,7 +1278,7 @@ class Where(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        inputs = _dtype_shape_promotion(inputs)
+        inputs =  (inputs)
         condition_rank = len(infer_shape(inputs[0]))
         x_rank = len(infer_shape(inputs[1]))
         y_rank = len(infer_shape(inputs[2]))
@@ -1447,6 +1439,7 @@ def get_convert_map():
         "squeeze": AttrCvt("squeeze", {"axes": "axis"}),
         "unsqueeze": Unsqueeze.get_converter(),
         "identity": Renamer("copy"),
+        "var": Variance.get_converter(),
     }
 
 
@@ -1635,7 +1628,11 @@ class OneflowGraph(object):
             print("{} should be defined by user".format(self._init_variable_node))
 
     def _parse_input(self, node, model_dir_path):
+        input_user_conf_list = []
         for input_name in node.user_conf.input:
+            input_user_conf_list.append(input_name)
+        input_user_conf_list.sort()
+        for input_name in input_user_conf_list:
             node_input_paths = getattr(node.user_conf.input[input_name], "s")
             for i in node_input_paths:
                 node_input = i.split("/")[0]
@@ -1718,7 +1715,11 @@ class OneflowGraph(object):
                 self._parse_input(node, model_dir_path=model_dir_path)
 
                 node_inputs = oneflow_input()
+                input_user_conf_list = []
                 for input_name in node.user_conf.input:
+                    input_user_conf_list.append(input_name)
+                input_user_conf_list.sort()
+                for input_name in input_user_conf_list:
                     node_input_paths = getattr(node.user_conf.input[input_name], "s")
                     for i in node_input_paths:
                         node_input = i.split("/")[0]
@@ -1764,8 +1765,7 @@ class OneflowGraph(object):
 
         # step 3: get the outputs
         outputs = []
-        for node_name in nodes:
-            node = nodes[node_name]
+        for node_name, node in nodes.items():
             if is_output_op(node):
                 node_name_v2 = getattr(node.output_conf, "in").split("/")[0]
                 if node_name in self._nodes:
@@ -1900,7 +1900,7 @@ def from_oneflow(graph, model_dir_path):
     graph_proto = graph._graph_proto
 
     # get all nodes
-    nodes = {}
+    nodes = OrderedDict()
     for op in graph_proto.net.op:
         nodes[op.name] = op
 
