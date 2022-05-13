@@ -78,6 +78,14 @@ class OneFlowGraph_v2(flow.nn.Graph):
         out = self.m(x1, x2, x3)
         return out
 
+class OneFlowGraph_v3(flow.nn.Graph):
+    def __init__(self, module):
+        super().__init__()
+        self.m = module
+
+    def build(self, x1, x2):
+        out = self.m(x1, x2)
+        return out
 
 def get_oneflow_output(model, inputs):
     flow_output = model(inputs)
@@ -90,7 +98,7 @@ def get_oneflow_concat_output(model, input1, input2, input3):
 
 
 def get_oneflow_elementwise_output(model, input1, input2):
-    return model(input1, input2)
+    return model(input1, input2).numpy()
 
 
 def get_tvm_output(graph, model_path, inputs: flow.tensor, target="llvm", dtype="float32"):
@@ -367,6 +375,32 @@ def verify_math_elementwise(
     assert_shape(out_flow, out_tvm)
     tvm.testing.assert_allclose(out_flow, out_tvm, rtol=rtol, atol=atol)
 
+def verify_matmul(
+    model,
+    name="",
+    rtol=1e-5,
+    atol=1e-5,
+    inputs1=flow.tensor(np.random.randn(2, 5), dtype=flow.float32),
+    inputs2=flow.tensor(np.random.randn(5, 2), dtype=flow.float32),
+    device="llvm",
+):
+    if device == "cuda":
+        model.to(device)
+        inputs1 = inputs1.to(device)
+        inputs2 = inputs2.to(device)
+
+    graph = OneFlowGraph_v3(model)
+    graph._compile(inputs1, inputs2)
+
+    mkdir(MODEL_HOME)
+    flow.save(model.state_dict(), MODEL_HOME)
+
+    out_flow = get_oneflow_elementwise_output(graph, inputs1, inputs2)
+    out_tvm = get_tvm_elementwise_output(graph, MODEL_HOME, inputs1, inputs2, target=device)
+    rmdir(MODEL_HOME)
+
+    assert_shape(out_flow, out_tvm)
+    tvm.testing.assert_allclose(out_flow, out_tvm, rtol=rtol, atol=atol)
 
 def verify_concat(
     model,
@@ -809,6 +843,43 @@ def test_where():
             model1, device=device, inputs=flow.tensor(np.random.randn(3, 6, 9).astype(np.int32))
         )
 
+@tvm.testing.uses_gpu
+def test_matmul():
+    class MatMul(flow.nn.Module):
+        def forward(self, x, y):
+            return flow._C.matmul(x, y)
+
+    class MatMulTranspose(flow.nn.Module):
+        def forward(self, x, y):
+            return flow._C.matmul(x, y, transpose_b=True)
+    class BatchMatMul(flow.nn.Module):
+        def forward(self, x, y):
+            return flow._C.batch_matmul(x, y)
+    
+    class BroadCastMatMul(flow.nn.Module):
+        def forward(self, x, y):
+            return flow._C.matmul(x, y)
+
+    model1 = MatMul().eval()
+    model2 = MatMulTranspose().eval()
+    model3 = BatchMatMul().eval()
+    model4 = BroadCastMatMul().eval()
+
+    for device in ["llvm"]:
+        verify_matmul(
+            model1, device=device, inputs1=flow.tensor(np.random.randn(2, 3).astype(np.float32)), inputs2=flow.tensor(np.random.randn(3, 3).astype(np.float32)
+        ))
+        verify_matmul(
+            model2, device=device, inputs1=flow.tensor(np.random.randn(1, 2).astype(np.float32)), inputs2=flow.tensor(np.random.randn(3, 2).astype(np.float32)
+        ))
+        verify_matmul(
+            model3, device=device, inputs1=flow.tensor(np.random.randn(2, 1, 2).astype(np.float32)), inputs2=flow.tensor(np.random.randn(2, 2, 3).astype(np.float32)
+        ))
+        verify_matmul(
+            model4, device=device, inputs1=flow.tensor(np.random.randn(3, 8, 8, 16).astype(np.float32)), inputs2=flow.tensor(np.random.randn(16, 8).astype(np.float32)
+        ))
+
+
 if __name__ == "__main__":
     test_conv2d()
     test_pool2d()
@@ -821,5 +892,6 @@ if __name__ == "__main__":
     test_concat()
     test_add_constant()
     test_logical()
-    test_where()
+    # test_where()
+    test_matmul()
     rmdir("log")

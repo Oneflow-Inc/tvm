@@ -26,7 +26,7 @@ import warnings
 import numpy as np
 import tvm
 from tvm.ir import IRModule
-from tvm.topi.utils import get_const_tuple
+from tvm.topi.utils import get_const_tuple, swap
 
 from .. import analysis
 from .. import expr as _expr
@@ -511,37 +511,134 @@ class MatMul(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 2, "Gemm op take 2 inputs, {} given".format(len(inputs))
+        assert len(inputs) == 2, "MatMul op take 2 inputs, {} given".format(len(inputs))
         # Similar to 'class Conv'
         true_names = ["weight"]
         false_names = ["_input."]
+        matmul_a_flag = False
+        matmul_b_flag = False
         for i in inputs:
             T_NAMES = any(x in str(i) for x in true_names)
             F_NAMES = any(x in str(i) for x in false_names)
             if T_NAMES and not F_NAMES:
                 matmul_b = i
+                matmul_b_flag = True
             else:
                 matmul_a = i
+                matmul_a_flag = True
 
-        dtype = infer_type(matmul_a).checked_type.dtype
+        if matmul_a_flag and matmul_b_flag:
+            inputs[0] = matmul_a
+            inputs[1] = matmul_b
 
+        dtype = infer_type(inputs[0]).checked_type.dtype
         # Y = alpha * A * B
         alpha = float(attrs.get("alpha", 1.0))
         transA = bool(attrs.get("transpose_a", False))
         transB = bool(attrs.get("transpose_b", False))
 
-        # get number of channels
-        channels = infer_channels(matmul_b, not transB)
+        a_shape = infer_shape(inputs[0])
+        b_shape = infer_shape(inputs[1])
+        if ((transA and transB and a_shape[-2] != b_shape[-1]) or 
+            (transA and not transB and a_shape[-2] != b_shape[-2]) or 
+            (transB and not transA and a_shape[-1] != b_shape[-1]) or
+            (not transB and not transA and a_shape[-1] != b_shape[-2])):
+            tmp1 = inputs[0]
+            tmp2 = inputs[1]
+            inputs[0] = tmp2
+            inputs[1] = tmp1
+
         if transA:
-            matmul_a = _op.transpose(matmul_a, axes=(1, 0))
-        if not transB:
-            matmul_b = _op.transpose(matmul_b, axes=(1, 0))
-        matmul_a = _op.nn.batch_flatten(matmul_a)
-        if alpha != 1.0:
-            matmul_a *= _expr.const(alpha, dtype=dtype)
+            perm = list(range(len(a_shape)))
+            perm[-2] = len(a_shape) - 1
+            perm[-1] = len(a_shape) - 2
+            inputs[0] = _op.transpose(inputs[0], axes=perm)
+        if transB:
+            perm = list(range(len(b_shape)))
+            perm[-2] = len(b_shape) - 1
+            perm[-1] = len(b_shape) - 2
+            inputs[1] = _op.transpose(inputs[1], axes=perm)
 
-        return _op.nn.dense(matmul_a, matmul_b, units=channels)
+        # This implemention almost keeps same with ONNX
+        # Need to check input shape as batch matmul must be supported.
+        a_shape = shape_of(inputs[0], dtype="int32")
+        a_rank = infer_shape(a_shape)[0]
+        b_shape = shape_of(inputs[1], dtype="int32")
+        b_rank = infer_shape(b_shape)[0]
+        # When performing a batch matmul, we need to properly handle N-dim shapes.
+        if a_rank > 2 or b_rank > 2:
 
+            def flatten_to_nd(x, x_shape, nd=3):
+                ndims = infer_shape(x_shape)[0]
+                if ndims == nd:
+                    return x
+                newshape = _op.concatenate(
+                    [
+                        _expr.const([-1], dtype=infer_type(x_shape).checked_type.dtype),
+                        _op.strided_slice(x_shape, [ndims - nd + 1], [ndims]),
+                    ],
+                    0,
+                )
+                out = _op.reshape(x, fold_constant(newshape))
+                return out
+
+            b_type = infer_type(inputs[1])
+            # Convert to dense if the second matrix is 2d and non-dynamic
+            if b_rank == 2 and not _ty.is_dynamic(b_type.checked_type):
+                a = flatten_to_nd(inputs[0], a_shape, 2)
+                b = _op.transpose(inputs[1])
+                output = _op.nn.dense(a, b)
+            else:
+                # Convert a and b into 3 dimensional tensors.
+                a = flatten_to_nd(inputs[0], a_shape, 3)
+                b = flatten_to_nd(inputs[1], b_shape, 3)
+                # Transpose matrix dimensions of b.
+                b = _op.transpose(b, [0, 2, 1])
+                # Perform a batch matmul.
+                output = _op.nn.batch_matmul(a, b)
+            # Determine the output batch dimension.
+            if a_rank > b_rank:
+                out_batch = _op.strided_slice(a_shape, [0], [a_rank - 2])
+            elif a_rank < b_rank:
+                out_batch = _op.strided_slice(b_shape, [0], [b_rank - 2])
+            # If its unclear how broadcasting should be applied, the output
+            # shape is determined by choosing the maximum value from each input.
+            else:
+                out_batch = _op.concatenate(
+                    [
+                        _op.maximum(
+                            _op.strided_slice(a_shape, [i], [i + 1]),
+                            _op.strided_slice(b_shape, [i], [i + 1]),
+                        )
+                        for i in range(a_rank - 2)
+                    ],
+                    0,
+                )
+            # Reshape output to original dimensions.
+            final_shape = _op.concatenate(
+                [
+                    out_batch,
+                    _op.strided_slice(
+                        a_shape, [infer_shape(a_shape)[0] - 2], [infer_shape(a_shape)[0] - 1]
+                    ),
+                    _op.strided_slice(
+                        b_shape, [infer_shape(b_shape)[0] - 1], [infer_shape(b_shape)[0]]
+                    ),
+                ],
+                0,
+            )
+            out = _op.reshape(output, fold_constant(final_shape))
+        else:
+            if b_rank == 1:
+                inputs[1] = _op.expand_dims(inputs[1], 1, 1)
+            # Otherwise a simple dense op will get the job done.
+            input_1_t = _op.transpose(inputs[1], axes=(1, 0))
+            out = _op.nn.dense(inputs[0], input_1_t)
+            if b_rank == 1:
+                out = _op.squeeze(out, axis=[-1])
+        if not np.isclose(alpha, 1.0):
+            out = out * _expr.const(alpha, dtype=dtype)
+        return out
 
 class Reduce(OneFlowOpConverter):
     """Operator converter for reduce ops"""
@@ -1328,6 +1425,8 @@ def get_convert_map():
         "upsample_bilinear_2d": UpsampleBiLinear.get_converter(),
         # defs/tensor
         "matmul": MatMul.get_converter(),
+        "batch_matmul": MatMul.get_converter(),
+        "broadcast_matmul": MatMul.get_converter(),
         "concat": Concat.get_converter(),
         "clip_by_scalar": Clip.get_converter(),
         "slice": Slice.get_converter(),

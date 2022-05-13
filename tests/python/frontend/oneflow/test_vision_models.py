@@ -34,6 +34,7 @@ from flowvision.models.squeezenet import squeezenet1_0
 from flowvision.models.shufflenet_v2 import shufflenet_v2_x0_5
 from flowvision.models.mobilenet import mobilenet_v2
 from flowvision.models.ghostnet import ghostnet
+from flowvision.models.vision_transformer import vit_base_patch16_224
 
 MODEL_HOME = "test_model"
 
@@ -118,66 +119,24 @@ def verify_model(
 
 @tvm.testing.uses_gpu
 def test_vision_models():
-    class AlexNet(flow.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = alexnet()
-
-        def forward(self, x):
-            x = self.net(x)
-            return x
-
-    class SqueezeNet(flow.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = squeezenet1_0()
-
-        def forward(self, x):
-            x = self.net(x)
-            return x
-
-    class ShuffleNet(flow.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = shufflenet_v2_x0_5()
-
-        def forward(self, x):
-            x = self.net(x)
-            return x
-    
-    class MobileNetV2(flow.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = mobilenet_v2()
-
-        def forward(self, x):
-            x = self.net(x)
-            return x
-    
-    class GhostNet(flow.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = ghostnet()
-
-        def forward(self, x):
-            x = self.net(x)
-            return x
 
     if os.path.exists(MODEL_HOME):
         rmdir(MODEL_HOME)
 
-    vision_alexnet = AlexNet().eval()
-    vision_squeezenet = SqueezeNet().eval()
-    vision_shufflenet = ShuffleNet().eval()
-    vision_mobilenetv2 = MobileNetV2().eval()
+    vision_alexnet = alexnet().eval()
+    vision_squeezenet = squeezenet1_0().eval()
+    vision_shufflenet = shufflenet_v2_x0_5().eval()
+    vision_mobilenetv2 = mobilenet_v2().eval()
     vision_ghostnet = ghostnet().eval()
+    vision_vit = vit_base_patch16_224().eval()
 
     for device in ["llvm"]:
-        verify_model(vision_alexnet, device=device)
-        verify_model(vision_squeezenet, device=device)
-        verify_model(vision_shufflenet, device=device)
-        verify_model(vision_mobilenetv2, device=device)
-        verify_model(vision_ghostnet, device=device)
+        # verify_model(vision_alexnet, device=device)
+        # verify_model(vision_squeezenet, device=device)
+        # verify_model(vision_shufflenet, device=device)
+        # verify_model(vision_mobilenetv2, device=device)
+        # verify_model(vision_ghostnet, device=device)
+        verify_model(vision_vit, device=device)
 
 if __name__ == "__main__":
     test_vision_models()
