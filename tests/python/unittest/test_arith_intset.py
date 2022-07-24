@@ -322,6 +322,20 @@ def test_region_lower_bound_for_non_perfect_tile():
     )
 
 
+def test_region_lower_bound_unfusable():
+    var_dom = {
+        tvm.tir.Var("i", "int32"): tvm.ir.Range(8),
+        tvm.tir.Var("j", "int32"): tvm.ir.Range(4),
+    }
+    i, j = var_dom
+    region = [
+        tvm.ir.Range.from_min_extent((i + j) // 2, 1),
+    ]
+    result = tvm.arith.estimate_region_lower_bound(region, var_dom, predicate=True)
+    assert result[0].min_value == 0
+    assert result[0].max_value == 5
+
+
 def test_union_lower_bound():
     neg_inf = tvm.arith.int_set.neg_inf()
     pos_inf = tvm.arith.int_set.pos_inf()

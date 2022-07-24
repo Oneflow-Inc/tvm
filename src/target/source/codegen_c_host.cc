@@ -62,6 +62,7 @@ void CodeGenCHost::Init(bool output_ssa, bool emit_asserts, std::string target_s
     decl_stream << "#include <dlpack/dlpack.h>\n";
     decl_stream << "#include <arm_nnfunctions.h>\n";
     decl_stream << "#include <arm_nn_types.h>\n";
+    decl_stream << "#include <arm_nn_math_types.h>\n";
   }
   CodeGenC::Init(output_ssa);
 }
@@ -403,7 +404,6 @@ runtime::Module BuildCHost(IRModule mod, Target target) {
   CodeGenCHost cg;
   cg.Init(output_ssa, emit_asserts, target->str(), devices);
   cg.SetConstantsByteAlignment(target->GetAttr<Integer>("constants-byte-alignment").value_or(16));
-  Map<String, LinkedParam> linked_params;
   PrimFunc aot_executor_fn;
 
   std::vector<std::pair<tvm::GlobalVar, tvm::BaseFunc>> funcs;

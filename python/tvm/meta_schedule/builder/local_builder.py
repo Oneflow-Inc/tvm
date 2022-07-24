@@ -137,7 +137,7 @@ class LocalBuilder(PyBuilder):
         super().__init__()
 
         if max_workers is None:
-            max_workers = cpu_count(logical=True)
+            max_workers = cpu_count(logical=False)
         logger.info("LocalBuilder: max_workers = %d", max_workers)
 
         self.max_workers = max_workers
@@ -254,8 +254,10 @@ def default_build(mod: IRModule, target: Target, _params: Optional[Dict[str, NDA
     """
     # pylint: disable=import-outside-toplevel
     from tvm.driver import build as tvm_build
+    from tvm.tir.transform import RemoveWeightLayoutRewriteBlock
 
     # pylint: enable=import-outside-toplevel
+    mod = RemoveWeightLayoutRewriteBlock()(mod)
     return tvm_build(mod, target=target)
 
 

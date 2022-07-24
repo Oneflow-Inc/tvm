@@ -23,8 +23,30 @@
  */
 #ifndef TVM_TARGET_LLVM_CODEGEN_LLVM_H_
 #define TVM_TARGET_LLVM_CODEGEN_LLVM_H_
-#include <llvm/IR/GlobalValue.h>
 #ifdef TVM_LLVM_VERSION
+
+#include <llvm/ADT/ArrayRef.h>
+#include <llvm/ADT/StringRef.h>
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/ConstantFolder.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/DerivedTypes.h>
+#if TVM_LLVM_VERSION >= 150
+#include <llvm/IR/FMF.h>
+#else
+#include <llvm/IR/Operator.h>
+#endif
+#include <llvm/IR/GlobalValue.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/Support/Casting.h>
+#if TVM_LLVM_VERSION >= 140
+#include <llvm/MC/TargetRegistry.h>
+#else
+#include <llvm/Support/TargetRegistry.h>
+#endif
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/module.h>
@@ -47,7 +69,26 @@
 
 #include "../../runtime/thread_storage_scope.h"
 #include "../../tir/transforms/ir_utils.h"
-#include "llvm_common.h"
+#include "codegen_params.h"
+
+namespace llvm {
+class Argument;
+class CallInst;
+class Function;
+class GlobalVariable;
+class Instruction;
+class PassManagerBuilder;
+class TargetMachine;
+class DIFile;
+class DICompileUnit;
+class MDNode;
+
+// Used in std::unique_ptr
+class Module;
+class DataLayout;
+class DIBuilder;
+class MDBuilder;
+}  // namespace llvm
 
 namespace tvm {
 namespace codegen {
@@ -60,6 +101,9 @@ using namespace tir;
 class CodeGenLLVM : public ExprFunctor<llvm::Value*(const PrimExpr&)>,
                     public StmtFunctor<void(const Stmt&)> {
  public:
+  CodeGenLLVM();           // Do not make it default here.
+  virtual ~CodeGenLLVM();  // Do not make it default here.
+
   /*!
    * \brief Create new code generator based on target machine.
    * \param tm The target machine
@@ -126,18 +170,6 @@ class CodeGenLLVM : public ExprFunctor<llvm::Value*(const PrimExpr&)>,
    */
   void AddLinkModule(std::unique_ptr<llvm::Module>&& mod);
   /*!
-   * \brief Link parameters into the module so they don't need to be supplied at runtime.
-   * Parameters can be linked into the module so that the generated code is easier to use, or so
-   * that RAM space doesn't need to be allocated for them. This function adds the given parameters
-   * to the generated LLVM module.
-   * \param storage_id_offset Offset added to the index of each entry in params_by_sid to form the
-   *     storage_id of that parameter. Storage ids for parameters are expected to be contiguous.
-   * \param params_by_sid Array of NDArray. Each entry is a parameter. The index of the array (added
-   *     to sid_offset) is the storage_id of the param.
-   * \param param_names Array containing the name for each param in params_by_sid.
-   */
-  void LinkParameters(const Map<String, LinkedParam> params);
-  /*!
    * \brief Create Value for expression e
    * \param e The expression to be created value for.
    * \return created value.
@@ -197,6 +229,9 @@ class CodeGenLLVM : public ExprFunctor<llvm::Value*(const PrimExpr&)>,
   llvm::Constant* GetGlobalConstant(
       llvm::Constant* const_data, const std::string& name = "",
       llvm::GlobalValue::LinkageTypes linkage_type = llvm::GlobalValue::InternalLinkage);
+  inline llvm::ConstantArray* NDArrayToLLVMArray(::tvm::runtime::NDArray arr) {
+    return codegen::NDArrayToLLVMArray(ctx_, arr);
+  }
 
  protected:
   /*!
@@ -213,6 +248,12 @@ class CodeGenLLVM : public ExprFunctor<llvm::Value*(const PrimExpr&)>,
     /*! \brief The alignment of allocation */
     int alignment{0};
   };
+  /*!
+   * \brief Convert tvm::runtime::String into llvm::StringRef
+   */
+  static llvm::StringRef MakeStringRef(const String& string) {
+    return llvm::StringRef(string.c_str(), string.size());
+  }
   /*!
    * \brief Execute falloca at the beginning of the
    *  currrent function and obtain its return value.
@@ -350,13 +391,12 @@ class CodeGenLLVM : public ExprFunctor<llvm::Value*(const PrimExpr&)>,
   llvm::Function* GetIntrinsicDecl(llvm::Intrinsic::ID id, llvm::Type* ret_type,
                                    llvm::ArrayRef<llvm::Type*> arg_types);
   /*!
-   * \brief Lookup or create a GlobalVariable whose content is the data field of a DLTensor for a
-   * given linked_param() CallNode.
-   * \param param_name Parameter name (e.g. unmangled, from lookup_param node).
-   * \return the GlobalVariable indicated in the brief.
+   * \brief Set target-related attributes on the LLVM function \p func. This
+   *        includes "target-cpu" and "target-features" if present.
+   *
+   * \param func The function to set attributes on.
    */
-  llvm::GlobalVariable* GetLinkedParamSymbol(const ::std::string& param_name,
-                                             llvm::ConstantArray* array);
+  void SetTargetAttributes(llvm::Function* func);
   /*!
    * \brief Get the number of elements in the given vector value.
    * \param vec The value, must be of a vector type.
@@ -397,7 +437,8 @@ class CodeGenLLVM : public ExprFunctor<llvm::Value*(const PrimExpr&)>,
   void CreateSerialFor(llvm::Value* begin, llvm::Value* end, llvm::Value* stride,
                        const Var& loop_var, const Stmt& body);
   // add alias information.
-  void AddAliasInfo(llvm::Instruction* load, const VarNode* buffer, PrimExpr index);
+  void AddAliasInfo(llvm::Instruction* inst, const VarNode* buffer_var, PrimExpr index,
+                    DataType access_dtype);
 
   llvm::GlobalVariable* AllocateSharedMemory(DataType dtype, size_t size,
                                              unsigned int shared_address_space, int alignment,
@@ -487,6 +528,7 @@ class CodeGenLLVM : public ExprFunctor<llvm::Value*(const PrimExpr&)>,
 
   /*! \brief Helper struct for debug infos. */
   struct DebugInfo {
+    ~DebugInfo();  // Because of the std::unique_ptr.
     std::unique_ptr<llvm::DIBuilder> di_builder_;
     llvm::DICompileUnit* compilation_unit_{nullptr};
     llvm::DIFile* file_{nullptr};
